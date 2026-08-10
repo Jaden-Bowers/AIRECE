@@ -154,8 +154,34 @@ bool render_pseudo_node(
                 ? " @0x" + hex_value(statement.address)
                 : " " + statement.evidence_id));
         emitted = true;
+        if (statement.kind == SemanticStatementKind::return_value ||
+            statement.kind == SemanticStatementKind::trap ||
+            statement.kind == SemanticStatementKind::fault ||
+            (statement.kind == SemanticStatementKind::call && statement.no_return)) {
+            break;
+        }
     }
     return emitted;
+}
+
+std::string qualified_label(
+    const CompactFunctionView& view,
+    const xair_cfg_node_id node) {
+    return "F" + hex_value(view.function.entry) + "_L" + std::to_string(node);
+}
+
+bool node_is_terminal(
+    const CompactFunctionView& view,
+    const xair_cfg_node_id node) {
+    return std::any_of(view.statements.begin(), view.statements.end(),
+        [node](const SemanticStatement& statement) {
+            return statement.node == node &&
+                (statement.kind == SemanticStatementKind::return_value ||
+                 statement.kind == SemanticStatementKind::trap ||
+                 statement.kind == SemanticStatementKind::fault ||
+                 (statement.kind == SemanticStatementKind::call &&
+                  statement.no_return));
+        });
 }
 
 const ControlTransfer* transfer_of_kind(
@@ -170,45 +196,127 @@ const ControlTransfer* transfer_of_kind(
     return found == view.control.transfers.end() ? nullptr : &*found;
 }
 
-void render_pseudo_target(
+bool direct_arm_to_join(
+    const CompactFunctionView& view,
+    const xair_cfg_node_id arm,
+    const xair_cfg_node_id join) {
+    if (node_is_terminal(view, arm)) return false;
+    std::size_t outgoing = 0;
+    for (const ControlTransfer& transfer : view.control.transfers) {
+        if (transfer.source != arm ||
+            transfer.kind == ControlTransferKind::call_target) {
+            continue;
+        }
+        ++outgoing;
+        if (transfer.target != join) return false;
+    }
+    return outgoing == 1;
+}
+
+bool uniquely_entered_from(
+    const CompactFunctionView& view,
+    const xair_cfg_node_id node,
+    const xair_cfg_node_id source) {
+    std::size_t incoming = 0;
+    for (const ControlTransfer& transfer : view.control.transfers) {
+        if (transfer.target != node ||
+            transfer.kind == ControlTransferKind::call_target) {
+            continue;
+        }
+        ++incoming;
+        if (transfer.source != source) return false;
+    }
+    return incoming == 1;
+}
+
+bool certified_if_region(
+    const CompactFunctionView& view,
+    const ControlRegion& region,
+    const ControlTransfer*& true_transfer,
+    const ControlTransfer*& false_transfer) {
+    if (region.kind != ControlRegionKind::if_else &&
+        region.kind != ControlRegionKind::terminal_if) {
+        return false;
+    }
+    true_transfer = transfer_of_kind(
+        view, region.header, ControlTransferKind::branch_true);
+    false_transfer = transfer_of_kind(
+        view, region.header, ControlTransferKind::branch_false);
+    if (true_transfer == nullptr || false_transfer == nullptr ||
+        true_transfer->target == false_transfer->target ||
+        !uniquely_entered_from(view, true_transfer->target, region.header) ||
+        !uniquely_entered_from(view, false_transfer->target, region.header)) {
+        return false;
+    }
+    if (region.kind == ControlRegionKind::terminal_if) {
+        return node_is_terminal(view, true_transfer->target) &&
+            node_is_terminal(view, false_transfer->target);
+    }
+    return region.join != XAIR_CFG_INVALID_ID &&
+        direct_arm_to_join(view, true_transfer->target, region.join) &&
+        direct_arm_to_join(view, false_transfer->target, region.join);
+}
+
+bool render_fallback_transfers(
     BudgetWriter& writer,
     const CompactFunctionView& view,
-    const ControlTransfer* transfer,
-    const xair_cfg_node_id join,
-    const std::unordered_set<xair_cfg_node_id>& local_nodes,
-    const std::unordered_set<xair_cfg_node_id>& label_targets,
-    std::unordered_set<xair_cfg_node_id>& defined_labels,
-    std::unordered_set<xair_cfg_node_id>& consumed,
-    const std::string& indent) {
-    if (transfer == nullptr) {
-        writer.line(indent + "/* unresolved control target */");
-        return;
+    const xair_cfg_node_id node,
+    const std::unordered_set<xair_cfg_node_id>& local_nodes) {
+    if (node_is_terminal(view, node)) return false;
+    const ControlTransfer* true_transfer = transfer_of_kind(
+        view, node, ControlTransferKind::branch_true);
+    const ControlTransfer* false_transfer = transfer_of_kind(
+        view, node, ControlTransferKind::branch_false);
+    if (true_transfer != nullptr && false_transfer != nullptr &&
+        local_nodes.contains(true_transfer->target) &&
+        local_nodes.contains(false_transfer->target)) {
+        ControlRegion condition_region;
+        condition_region.header = node;
+        condition_region.condition = true_transfer->condition;
+        writer.line("    if (" + region_condition(view, condition_region) + ") goto " +
+            qualified_label(view, true_transfer->target) + "; else goto " +
+            qualified_label(view, false_transfer->target) + ";");
+        return true;
     }
-    if (transfer->kind == ControlTransferKind::break_loop) {
-        writer.line(indent + "break;");
-        return;
+
+    std::vector<xair_cfg_node_id> indirect_targets;
+    bool emitted = false;
+    for (const ControlTransfer& transfer : view.control.transfers) {
+        if (transfer.source != node ||
+            transfer.kind == ControlTransferKind::call_target ||
+            transfer.kind == ControlTransferKind::return_from_function) {
+            continue;
+        }
+        if (transfer.kind == ControlTransferKind::switch_case) {
+            if (local_nodes.contains(transfer.target)) {
+                indirect_targets.push_back(transfer.target);
+            }
+            continue;
+        }
+        if (local_nodes.contains(transfer.target)) {
+            writer.line("    goto " + qualified_label(view, transfer.target) + ";");
+            emitted = true;
+        } else {
+            writer.line("    /* control leaves function at 0x" +
+                hex_value(transfer.raw_target) + " */");
+            emitted = true;
+        }
     }
-    if (transfer->kind == ControlTransferKind::continue_loop) {
-        writer.line(indent + "continue;");
-        return;
+    if (!indirect_targets.empty()) {
+        std::sort(indirect_targets.begin(), indirect_targets.end());
+        indirect_targets.erase(
+            std::unique(indirect_targets.begin(), indirect_targets.end()),
+            indirect_targets.end());
+        std::string line = "    goto_one_of(";
+        for (std::size_t index = 0; index < indirect_targets.size(); ++index) {
+            if (index != 0) line += ", ";
+            line += qualified_label(view, indirect_targets[index]);
+        }
+        line += "); /* switch case values unresolved */";
+        writer.line(line);
+        emitted = true;
     }
-    if (transfer->target == join) {
-        writer.line(indent + "/* join n" + std::to_string(join) + " */");
-        return;
-    }
-    if (!local_nodes.contains(transfer->target)) {
-        writer.line(indent + "/* control leaves function at 0x" +
-            hex_value(transfer->raw_target) + " */");
-        return;
-    }
-    if (label_targets.contains(transfer->target) &&
-        defined_labels.insert(transfer->target).second) {
-        writer.line("label_n" + std::to_string(transfer->target) + ":");
-    }
-    if (!render_pseudo_node(writer, view, transfer->target, indent)) {
-        writer.line(indent + "/* block n" + std::to_string(transfer->target) + " */");
-    }
-    consumed.insert(transfer->target);
+    return emitted;
 }
 
 } // namespace
@@ -225,6 +333,8 @@ RenderedSemanticText render_compact(
     writer.line("coverage: exact=" + std::to_string(view.coverage.exact_percent) +
         "% partial-blocks=" + std::to_string(view.coverage.partial_blocks) +
         " opaque-blocks=" + std::to_string(view.coverage.opaque_blocks) +
+        " exact-instructions=" + std::to_string(view.coverage.exact_instructions) +
+        "/" + std::to_string(view.coverage.total_instructions) +
         " unresolved=" + std::to_string(view.coverage.unresolved_operations));
     writer.line(std::string("completeness: ") + (view.complete ? "complete" : "partial"));
 
@@ -313,116 +423,40 @@ RenderedSemanticText render_pseudo(
     std::unordered_set<xair_cfg_node_id> local_nodes(
         view.control.block_order.begin(), view.control.block_order.end());
     std::unordered_set<xair_cfg_node_id> consumed;
-    std::unordered_set<xair_cfg_node_id> label_targets;
-    std::unordered_set<xair_cfg_node_id> defined_labels;
-    for (const ControlTransfer& transfer : view.control.transfers) {
-        if (transfer.explicit_goto && local_nodes.contains(transfer.target)) {
-            label_targets.insert(transfer.target);
-        }
-    }
     std::unordered_map<xair_cfg_node_id, const ControlRegion*> structured;
     for (const ControlRegion& region : view.control.regions) {
-        if (region.kind != ControlRegionKind::sequence &&
-            region.kind != ControlRegionKind::block &&
-            region.kind != ControlRegionKind::irreducible) {
+        const ControlTransfer* true_transfer = nullptr;
+        const ControlTransfer* false_transfer = nullptr;
+        if (certified_if_region(view, region, true_transfer, false_transfer)) {
             structured.emplace(region.header, &region);
         }
     }
     for (const xair_cfg_node_id node : view.control.block_order) {
         if (consumed.contains(node)) continue;
+        writer.line(qualified_label(view, node) + ":");
         const auto region_entry = structured.find(node);
         if (region_entry != structured.end()) {
             const ControlRegion& region = *region_entry->second;
             const std::string condition = region_condition(view, region);
-            if (label_targets.contains(node) && defined_labels.insert(node).second) {
-                writer.line("label_n" + std::to_string(node) + ":");
-            }
-            if (region.kind == ControlRegionKind::if_else ||
-                region.kind == ControlRegionKind::terminal_if ||
-                region.kind == ControlRegionKind::early_return) {
-                (void)render_pseudo_node(writer, view, node, "    ");
-                const ControlTransfer* true_transfer = transfer_of_kind(
-                    view, node, ControlTransferKind::branch_true);
-                const ControlTransfer* false_transfer = transfer_of_kind(
-                    view, node, ControlTransferKind::branch_false);
-                writer.line("    if (" + condition + ") {");
-                render_pseudo_target(writer, view, true_transfer, region.join,
-                                     local_nodes, label_targets, defined_labels,
-                                     consumed, "        ");
-                writer.line("    }");
-                if (false_transfer != nullptr) {
-                    writer.line("    else {");
-                    render_pseudo_target(writer, view, false_transfer, region.join,
-                                         local_nodes, label_targets, defined_labels,
-                                         consumed, "        ");
-                    writer.line("    }");
-                }
-                consumed.insert(node);
-                continue;
-            }
-            if (region.kind == ControlRegionKind::while_loop ||
-                region.kind == ControlRegionKind::do_while_loop) {
-                if (region.kind == ControlRegionKind::while_loop) {
-                    writer.line("    while (" + condition + ") {");
-                } else {
-                    writer.line("    do {");
-                }
-                for (const xair_cfg_node_id member : region.nodes) {
-                    if (label_targets.contains(member) &&
-                        defined_labels.insert(member).second) {
-                        writer.line("label_n" + std::to_string(member) + ":");
-                    }
-                    (void)render_pseudo_node(writer, view, member, "        ");
-                    for (const ControlTransfer& transfer : view.control.transfers) {
-                        if (transfer.source != member) continue;
-                        if (transfer.kind == ControlTransferKind::break_loop) {
-                            writer.line("        break;");
-                        } else if (transfer.kind == ControlTransferKind::continue_loop) {
-                            writer.line("        continue;");
-                        }
-                    }
-                    consumed.insert(member);
-                }
-                writer.line(region.kind == ControlRegionKind::while_loop
-                    ? "    }" : "    } while (" + condition + ");");
-                continue;
-            }
-            if (region.kind == ControlRegionKind::switch_region) {
-                (void)render_pseudo_node(writer, view, node, "    ");
-                writer.line("    switch (" + condition + ") {");
-                for (const ControlTransfer& transfer : view.control.transfers) {
-                    if (transfer.source != node ||
-                        transfer.kind == ControlTransferKind::call_target) continue;
-                    writer.line("    case 0x" + hex_value(transfer.raw_target) + ":");
-                    render_pseudo_target(writer, view, &transfer,
-                                         XAIR_CFG_INVALID_ID, local_nodes,
-                                         label_targets, defined_labels, consumed,
-                                         "        ");
-                    writer.line("        break;");
-                }
-                writer.line("    }");
-                consumed.insert(node);
-                continue;
-            }
-        }
-        bool needs_label = view.control.irreducible;
-        for (const ControlTransfer& transfer : view.control.transfers) {
-            needs_label = needs_label ||
-                (transfer.target == node && transfer.explicit_goto);
-        }
-        if (needs_label && defined_labels.insert(node).second) {
-            writer.line("label_n" + std::to_string(node) + ":");
+            const ControlTransfer* true_transfer = transfer_of_kind(
+                view, node, ControlTransferKind::branch_true);
+            const ControlTransfer* false_transfer = transfer_of_kind(
+                view, node, ControlTransferKind::branch_false);
+            (void)render_pseudo_node(writer, view, node, "    ");
+            writer.line("    if (" + condition + ") {");
+            (void)render_pseudo_node(
+                writer, view, true_transfer->target, "        ");
+            writer.line("    } else {");
+            (void)render_pseudo_node(
+                writer, view, false_transfer->target, "        ");
+            writer.line("    }");
+            consumed.insert(node);
+            consumed.insert(true_transfer->target);
+            consumed.insert(false_transfer->target);
+            continue;
         }
         bool emitted = render_pseudo_node(writer, view, node, "    ");
-        for (const ControlTransfer& transfer : view.control.transfers) {
-            if (transfer.source != node || !transfer.explicit_goto) continue;
-            if (local_nodes.contains(transfer.target)) {
-                writer.line("    goto label_n" + std::to_string(transfer.target) + ";");
-            } else {
-                writer.line("    /* unresolved transfer outside function */");
-            }
-            emitted = true;
-        }
+        emitted = render_fallback_transfers(writer, view, node, local_nodes) || emitted;
         if (!emitted) writer.line("    /* no recovered XAIR statements */");
         consumed.insert(node);
     }

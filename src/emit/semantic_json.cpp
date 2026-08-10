@@ -74,8 +74,13 @@ std::string render_semantic_json(
     out << ",\"coverage\":{\"exact_blocks\":" << view.coverage.exact_blocks <<
         ",\"partial_blocks\":" << view.coverage.partial_blocks <<
         ",\"opaque_blocks\":" << view.coverage.opaque_blocks <<
+        ",\"exact_instructions\":" << view.coverage.exact_instructions <<
+        ",\"nonexact_instructions\":" << view.coverage.nonexact_instructions <<
+        ",\"total_instructions\":" << view.coverage.total_instructions <<
         ",\"unresolved_operations\":" << view.coverage.unresolved_operations <<
-        ",\"exact_percent\":" << view.coverage.exact_percent << "}";
+        ",\"exact_percent\":" << view.coverage.exact_percent <<
+        ",\"exact_instruction_percent\":" <<
+            view.coverage.exact_instruction_percent << "}";
     out << ",\"omitted\":{\"calls\":" << view.omitted.calls <<
         ",\"branches\":" << view.omitted.branches <<
         ",\"statements\":" << view.omitted.statements <<
@@ -259,7 +264,14 @@ std::string render_semantic_json(
             "\"},\"complete\":false,\"truncated\":true,\"completeness_reason\":"
             "\"max-bytes\",\"required_bytes\":" << result.size() << "}\n";
         result = bounded.str();
-        if (result.size() > max_bytes) result.clear();
+        if (result.size() > max_bytes) {
+            /* A byte budget is never permission to emit malformed JSON.  Keep
+             * the smallest valid document when possible; budgets below two
+             * bytes are reported as an explicit CLI failure. */
+            if (max_bytes >= 3) result = "{}\n";
+            else if (max_bytes == 2) result = "{}";
+            else result.clear();
+        }
     }
     return result;
 }

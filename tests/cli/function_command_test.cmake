@@ -35,7 +35,7 @@ execute_process(
 if(NOT _pseudo_result EQUAL 0 AND NOT _pseudo_result EQUAL 3)
     message(FATAL_ERROR "pseudo fn failed (${_pseudo_result}): ${_pseudo_error}")
 endif()
-foreach(_required IN ITEMS "if (" "else {" "F140001000:S:")
+foreach(_required IN ITEMS "if (" "F140001000_L" "goto F140001000_L")
     string(FIND "${_pseudo}" "${_required}" _found)
     if(_found EQUAL -1)
         message(FATAL_ERROR "pseudo output lacks '${_required}':\n${_pseudo}")

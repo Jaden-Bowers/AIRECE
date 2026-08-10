@@ -1,6 +1,18 @@
 cmake_minimum_required(VERSION 3.25)
 
+if(POLICY CMP0184)
+    cmake_policy(SET CMP0184 NEW)
+endif()
+
 project(AIRECE VERSION 0.10.0 LANGUAGES C CXX)
+
+# CMake projects configured before CMP0184 may retain /RTC1 in cached Debug
+# flags.  Move that setting to the target property so the CRT-free compiler
+# fixture can explicitly opt out while normal Debug targets keep the default.
+if(POLICY CMP0184)
+    string(REPLACE "/RTC1" "" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+    string(REPLACE "/RTC1" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+endif()
 
 include(CTest)
 include(GNUInstallDirs)
@@ -209,6 +221,26 @@ add_custom_command(
 add_custom_target(airece_notices ALL DEPENDS "${AIRECE_NOTICE_OUTPUT}")
 
 if(BUILD_TESTING)
+    add_library(airece_semantic_source_fixture SHARED
+        tests/fixtures/semantic_contract.c)
+    set_target_properties(airece_semantic_source_fixture PROPERTIES
+        OUTPUT_NAME "airece-semantic-source-fixture")
+    if(MSVC)
+        target_compile_options(airece_semantic_source_fixture PRIVATE
+            /Od /Ob0 /GS-)
+        if(POLICY CMP0184)
+            set_property(TARGET airece_semantic_source_fixture PROPERTY
+                MSVC_RUNTIME_CHECKS "")
+        else()
+            target_compile_definitions(airece_semantic_source_fixture PRIVATE
+                AIRECE_RTC_STUBS=1)
+        endif()
+        target_link_options(airece_semantic_source_fixture PRIVATE
+            /ENTRY:airece_semantic_entry /NODEFAULTLIB)
+    else()
+        target_compile_options(airece_semantic_source_fixture PRIVATE -O0)
+    endif()
+
     add_executable(airece_decoder_boundary_tests
         tests/semantic/decoder_boundary_test.cpp)
     target_compile_features(airece_decoder_boundary_tests PRIVATE cxx_std_20)
@@ -313,6 +345,12 @@ if(BUILD_TESTING)
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/flow_command_test.cmake")
 
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME airece_source_semantics
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/source_semantics_test.py"
+            $<TARGET_FILE:airece>
+            $<TARGET_FILE:airece_semantic_source_fixture>)
+
     add_test(NAME airece_evaluation_smoke
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/evaluate.py"
             --airece $<TARGET_FILE:airece>

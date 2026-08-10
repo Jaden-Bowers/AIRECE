@@ -5,3 +5,5 @@
 *.user
 *.suo
 *.VC.db
+__pycache__/
+*.py[cod]

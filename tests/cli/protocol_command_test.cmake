@@ -17,6 +17,29 @@ foreach(_required IN ITEMS "\"schema\":\"airece.semantic.v1\"" "\"statements\"" 
     endif()
 endforeach()
 
+# Every successful JSON command must produce a valid JSON document, even when
+# the requested budget cannot hold the semantic schema.  A one-byte budget is
+# impossible and must fail with an actionable stderr diagnostic.
+execute_process(COMMAND "${AIRECE_EXE}" fn "${FIXTURE}" 0x140001000 --view json
+    --max-bytes 2
+    RESULT_VARIABLE _tiny_json_result OUTPUT_VARIABLE _tiny_json
+    ERROR_VARIABLE _tiny_json_error)
+if(NOT _tiny_json_result EQUAL 3 OR NOT _tiny_json STREQUAL "{}")
+    message(FATAL_ERROR "two-byte JSON budget must return valid {}: result=${_tiny_json_result} output=${_tiny_json} error=${_tiny_json_error}")
+endif()
+
+execute_process(COMMAND "${AIRECE_EXE}" fn "${FIXTURE}" 0x140001000 --view json
+    --max-bytes 1
+    RESULT_VARIABLE _impossible_json_result OUTPUT_VARIABLE _impossible_json
+    ERROR_VARIABLE _impossible_json_error)
+if(NOT _impossible_json_result EQUAL 1 OR NOT _impossible_json STREQUAL "")
+    message(FATAL_ERROR "one-byte JSON budget must fail with empty stdout")
+endif()
+string(FIND "${_impossible_json_error}" "at least 2 bytes" _tiny_error_found)
+if(_tiny_error_found EQUAL -1)
+    message(FATAL_ERROR "impossible JSON budget diagnostic missing: ${_impossible_json_error}")
+endif()
+
 set(_malformed "${CMAKE_CURRENT_BINARY_DIR}/airece-phase9-malformed.bin")
 file(WRITE "${_malformed}" "not-a-valid-executable")
 execute_process(COMMAND "${AIRECE_EXE}" inspect "${_malformed}"

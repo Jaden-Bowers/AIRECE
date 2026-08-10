@@ -613,9 +613,16 @@ int function_command(const int argc, char** argv) {
         return is_complete(*opened.session) ? exit_success : exit_partial;
     }
     if (view_name == "json") {
-        std::cout << airece::render_semantic_json(
+        const std::string rendered = airece::render_semantic_json(
             semantic, enrich ? &enrichment : nullptr, compact_options.max_bytes);
-        return is_complete(*opened.session) && semantic.complete &&
+        if (rendered.empty()) {
+            std::cerr << "airece: JSON byte budget is too small; at least 2 bytes "
+                         "are required for a valid document\n";
+            return exit_failure;
+        }
+        std::cout << rendered;
+        const bool minimal_budget_document = rendered == "{}" || rendered == "{}\n";
+        return !minimal_budget_document && is_complete(*opened.session) && semantic.complete &&
             (!enrich || enrichment.completion == airece::EnrichmentCompletion::complete)
             ? exit_success : exit_partial;
     }

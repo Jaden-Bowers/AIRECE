@@ -60,9 +60,112 @@ def manifest_inputs(path: pathlib.Path) -> Iterable[tuple[pathlib.Path, list[str
 
 
 def undefined_labels(pseudo: str) -> list[str]:
-    definitions = set(re.findall(r"(?m)^(label_n\d+):", pseudo))
-    references = set(re.findall(r"\bgoto (label_n\d+)\s*;", pseudo))
+    definitions = set(re.findall(r"(?m)^(F[0-9a-fA-F]+_L\d+):", pseudo))
+    references = set(re.findall(r"\b(F[0-9a-fA-F]+_L\d+)\b", pseudo))
     return sorted(references - definitions)
+
+
+def sampled_function_addresses(
+    listing: str, entry: str, limit: int,
+) -> list[str]:
+    """Select the entry plus deterministic, evenly spread discovered functions."""
+    addresses = [
+        match.group(1).lower()
+        for match in re.finditer(r"(?m)^(0x[0-9a-fA-F]+)\s+", listing)
+    ]
+    addresses = list(dict.fromkeys(addresses))
+    entry = entry.lower()
+    if entry not in addresses:
+        addresses.insert(0, entry)
+    if limit <= 0 or len(addresses) <= limit:
+        selected = addresses
+    elif limit == 1:
+        selected = [entry]
+    else:
+        indexes = {
+            round(index * (len(addresses) - 1) / (limit - 1))
+            for index in range(limit)
+        }
+        selected = [addresses[index] for index in sorted(indexes)]
+        if entry not in selected:
+            selected[-1] = entry
+    return [entry, *(address for address in selected if address != entry)][:limit]
+
+
+def evaluate_function(
+    executable: pathlib.Path,
+    binary: pathlib.Path,
+    address: str,
+    common: tuple[str, ...],
+    timeout: float,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {"address": address, "checks": {}}
+    full = command(
+        executable, "fn", str(binary), address, "--view", "json",
+        "--max-bytes", "65536", "--max-statements", "128",
+        "--max-evidence", "128", *common, timeout=timeout,
+    )
+    limited = command(
+        executable, "fn", str(binary), address, "--view", "json",
+        "--max-bytes", "65536", "--max-statements", "2",
+        "--max-evidence", "1", *common, timeout=timeout,
+    )
+    pseudo = command(
+        executable, "fn", str(binary), address, "--view", "pseudo",
+        "--max-bytes", "65536", "--max-statements", "128", *common,
+        timeout=timeout,
+    )
+    try:
+        full_json = json.loads(full["stdout"])
+        limited_json = json.loads(limited["stdout"])
+        json_valid = True
+    except json.JSONDecodeError as error:
+        full_json = {}
+        limited_json = {}
+        json_valid = False
+        record["json_error"] = str(error)
+    record["checks"]["json_valid"] = json_valid
+    record["checks"]["json_bounded"] = len(full["stdout"].encode("utf-8")) <= 65536
+    full_ids = [item.get("id") for item in full_json.get("statements", [])]
+    limited_ids = [item.get("id") for item in limited_json.get("statements", [])]
+    record["checks"]["stable_ids"] = full_ids[: len(limited_ids)] == limited_ids
+    missing = undefined_labels(pseudo["stdout"])
+    record["checks"]["no_undefined_labels"] = not missing
+    if missing:
+        record["undefined_labels"] = missing
+
+    statements = full_json.get("statements", [])
+    machine_state = re.compile(
+        r"\b(rsp|carry|parity|auxiliary|zero|sign|overflow)\b", re.IGNORECASE)
+    returns = [item for item in statements if item.get("kind") == "return"]
+    record["checks"]["abi_returns_only"] = all(
+        len(item.get("values", [])) <= 1 and not machine_state.search(item.get("text", ""))
+        for item in returns
+    )
+    reads = [item for item in statements if item.get("kind") == "memory-read"]
+    record["checks"]["result_destinations"] = all(
+        "(" not in item.get("text", "").split("=", 1)[0]
+        for item in reads
+    )
+    terminal_seen: set[int] = set()
+    source_order_safe = True
+    for item in statements:
+        node = item.get("node")
+        if node in terminal_seen:
+            source_order_safe = False
+            break
+        if item.get("kind") in {"return", "trap", "fault"} or item.get("no_return"):
+            terminal_seen.add(node)
+    record["checks"]["no_statements_after_terminal"] = source_order_safe
+    record["checks"]["switch_values_safe"] = not re.search(
+        r"(?m)^\s*case\s+0x", pseudo["stdout"])
+    record["coverage"] = full_json.get("coverage", {})
+    record["statements"] = len(statements)
+    record["regions"] = len(full_json.get("control", {}).get("regions", []))
+    record["transfers"] = len(full_json.get("control", {}).get("transfers", []))
+    record["semantic_json_bytes"] = len(full["stdout"].encode("utf-8"))
+    record["passed"] = all(record["checks"].values())
+    return record
 
 
 def evaluate_binary(
@@ -72,6 +175,7 @@ def evaluate_binary(
     categories: list[str],
     timeout: float,
     wall_time_ms: int,
+    functions_per_binary: int,
 ) -> dict[str, Any]:
     common = (
         "--profile", "fast",
@@ -103,45 +207,25 @@ def evaluate_binary(
         return record
 
     entry = entry_match.group(1)
-    full = command(
-        executable, "fn", str(binary), entry, "--view", "json",
-        "--max-bytes", "65536", "--max-statements", "128",
-        "--max-evidence", "128", *common, timeout=timeout,
-    )
-    limited = command(
-        executable, "fn", str(binary), entry, "--view", "json",
-        "--max-bytes", "65536", "--max-statements", "2",
-        "--max-evidence", "1", *common, timeout=timeout,
-    )
-    pseudo = command(
-        executable, "fn", str(binary), entry, "--view", "pseudo",
-        "--max-bytes", "65536", "--max-statements", "128", *common,
-        timeout=timeout,
-    )
-    try:
-        full_json = json.loads(full["stdout"])
-        limited_json = json.loads(limited["stdout"])
-        json_valid = True
-    except json.JSONDecodeError as error:
-        full_json = {}
-        limited_json = {}
-        json_valid = False
-        record["json_error"] = str(error)
-    record["checks"]["json_valid"] = json_valid
-    record["checks"]["json_bounded"] = len(full["stdout"].encode("utf-8")) <= 65536
-    full_ids = [item.get("id") for item in full_json.get("statements", [])]
-    limited_ids = [item.get("id") for item in limited_json.get("statements", [])]
-    record["checks"]["stable_ids"] = full_ids[: len(limited_ids)] == limited_ids
-    missing = undefined_labels(pseudo["stdout"])
-    record["checks"]["no_undefined_labels"] = not missing
-    if missing:
-        record["undefined_labels"] = missing
-    coverage = full_json.get("coverage", {})
+    listing = command(executable, "functions", str(binary), *common, timeout=timeout)
+    record["checks"]["functions_listed"] = listing["exit"] in (0, 3)
+    addresses = sampled_function_addresses(
+        listing["stdout"], entry, functions_per_binary)
+    record["function_results"] = [
+        evaluate_function(executable, binary, address, common, timeout)
+        for address in addresses
+    ]
+    record["functions_sampled"] = len(record["function_results"])
+    record["checks"]["sampled_functions_pass"] = all(
+        item["passed"] for item in record["function_results"])
+    coverage = {
+        key: sum(item.get("coverage", {}).get(key, 0)
+                 for item in record["function_results"])
+        for key in ("exact_blocks", "partial_blocks", "opaque_blocks",
+                    "exact_instructions", "nonexact_instructions",
+                    "total_instructions")
+    }
     record["coverage"] = coverage
-    record["statements"] = len(full_json.get("statements", []))
-    record["regions"] = len(full_json.get("control", {}).get("regions", []))
-    record["transfers"] = len(full_json.get("control", {}).get("transfers", []))
-    record["semantic_json_bytes"] = len(full["stdout"].encode("utf-8"))
     record["passed"] = all(record["checks"].values())
     return record
 
@@ -154,6 +238,8 @@ def main() -> int:
                         help="Assemblage PE binaries.tar.xz (streamed; never fully extracted)")
     parser.add_argument("--binary", action="append", type=pathlib.Path, default=[])
     parser.add_argument("--max-samples", type=int, default=20)
+    parser.add_argument("--functions-per-binary", type=int, default=5,
+                        help="deterministic entry-plus-spread function sample")
     parser.add_argument("--max-member-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--timeout-seconds", type=float, default=15.0)
     parser.add_argument("--wall-time-ms", type=int, default=5000)
@@ -177,6 +263,7 @@ def main() -> int:
         results.append(evaluate_binary(
             arguments.airece, path, str(path), categories,
             arguments.timeout_seconds, arguments.wall_time_ms,
+            arguments.functions_per_binary,
         ))
 
     if arguments.assemblage and len(results) < arguments.max_samples:
@@ -210,12 +297,19 @@ def main() -> int:
                         arguments.airece, destination,
                         f"assemblage:{member.name}", ["assemblage", "pe"],
                         arguments.timeout_seconds, arguments.wall_time_ms,
+                        arguments.functions_per_binary,
                     ))
 
     exact_blocks = sum(item.get("coverage", {}).get("exact_blocks", 0) for item in results)
     partial_blocks = sum(item.get("coverage", {}).get("partial_blocks", 0) for item in results)
     opaque_blocks = sum(item.get("coverage", {}).get("opaque_blocks", 0) for item in results)
     total_blocks = exact_blocks + partial_blocks + opaque_blocks
+    exact_instructions = sum(
+        item.get("coverage", {}).get("exact_instructions", 0) for item in results)
+    nonexact_instructions = sum(
+        item.get("coverage", {}).get("nonexact_instructions", 0) for item in results)
+    total_instructions = sum(
+        item.get("coverage", {}).get("total_instructions", 0) for item in results)
     report = {
         "schema": "airece.evaluation.v1",
         "samples": len(results),
@@ -225,7 +319,13 @@ def main() -> int:
             "exact_blocks": exact_blocks,
             "partial_blocks": partial_blocks,
             "opaque_blocks": opaque_blocks,
+            "exact_instructions": exact_instructions,
+            "nonexact_instructions": nonexact_instructions,
+            "total_instructions": total_instructions,
             "frequency_weighted_exact_percent":
+                round(exact_instructions * 100 / total_instructions, 3)
+                if total_instructions else 0.0,
+            "block_weighted_exact_percent":
                 round(exact_blocks * 100 / total_blocks, 3) if total_blocks else 0.0,
         },
         "results": results,

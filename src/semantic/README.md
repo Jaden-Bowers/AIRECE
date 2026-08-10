@@ -85,8 +85,10 @@ natural while/do-while loops, and bounded switches. Every region references the
 original CFG nodes and address evidence.
 
 Every function CFG edge, including call and tail-call edges, receives a
-`ControlTransfer`. Back edges and loop exits are displayed as continue/break;
-unrecognized and irreducible transfers remain explicit gotos. Unreachable
+`ControlTransfer`. The text emitter structures only a single-block conditional
+whose arms and join are certified. Loops, unresolved switch mappings,
+unrecognized transfers, and irreducible regions use function-qualified labels
+and gotos; switch target addresses are not case constants. Unreachable
 function nodes are appended deterministically instead of being dropped. A
 failed or budget-limited analysis therefore degrades to labelled block-order
 orientation rather than inventing structured semantics.

@@ -70,8 +70,12 @@ struct SemanticCoverage {
     std::size_t exact_blocks{};
     std::size_t partial_blocks{};
     std::size_t opaque_blocks{};
+    std::size_t exact_instructions{};
+    std::size_t nonexact_instructions{};
+    std::size_t total_instructions{};
     std::size_t unresolved_operations{};
     std::uint32_t exact_percent{};
+    std::uint32_t exact_instruction_percent{};
 };
 
 struct OmittedSemanticItems {

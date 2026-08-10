@@ -242,6 +242,17 @@ struct CompactRecovery::Impl {
         return expression ? expression.text : "v" + std::to_string(value);
     }
 
+    static std::string result_text(
+        const xair_value_id value,
+        const std::unordered_map<xair_value_id, std::string>& names) {
+        const auto named = names.find(value);
+        if (named != names.end()) return named->second;
+        /* A result position is storage, never a recovered expression.  Keeping
+         * this separate from value_text prevents text such as
+         * `load64(p) = load64(p)` when ExpressionRecovery inlines the load. */
+        return "tmp_v" + std::to_string(value);
+    }
+
     static std::string target_for(
         const xair_block_id block,
         const std::unordered_map<xair_block_id, std::uint64_t>& block_addresses,
@@ -265,6 +276,36 @@ struct CompactRecovery::Impl {
         statement.confidence = evidence.confidence;
         statement.synthetic = evidence.synthetic;
         target.push_back(std::move(statement));
+    }
+
+    std::size_t exact_instruction_count(const xair_cfg_node& node) const {
+        if (node.semantic_coverage == XAIR_CFG_SEMANTICS_EXACT) {
+            return node.instruction_count;
+        }
+        if (node.semantic_coverage == XAIR_CFG_SEMANTICS_OPAQUE) return 0;
+        std::size_t exact = node.instruction_count -
+            std::min<std::size_t>(node.opaque_instruction_count,
+                                  node.instruction_count);
+        if (node.incomplete_address == 0) return exact;
+
+        /* An unsupported instruction terminates lifting for the remainder of
+         * the block.  Those unvisited instructions are non-exact even though
+         * opaque_instruction_count only describes instructions the lifter
+         * actually reached.  Count the canonical decoded prefix conservatively. */
+        std::size_t prefix = 0;
+        std::uint64_t address = node.start;
+        while (address < node.incomplete_address && address < node.end &&
+               prefix < node.instruction_count) {
+            xair_x86_decoded_inst instruction{};
+            if (xair_decode_instruction(&binary, address, &instruction) != XAIR_OK ||
+                instruction.length == 0 ||
+                instruction.length > node.incomplete_address - address) {
+                break;
+            }
+            ++prefix;
+            address += instruction.length;
+        }
+        return std::min(exact, prefix);
     }
 
     CompactFunctionView build_uncached(
@@ -331,6 +372,11 @@ struct CompactRecovery::Impl {
             } else {
                 ++view.coverage.opaque_blocks;
             }
+            view.coverage.total_instructions += node->instruction_count;
+            const std::size_t exact_instructions = exact_instruction_count(*node);
+            view.coverage.exact_instructions += exact_instructions;
+            view.coverage.nonexact_instructions +=
+                node->instruction_count - exact_instructions;
             if (node->ir_block != XAIR_INVALID_ID) {
                 block_nodes[node->ir_block] = node_id;
                 block_addresses[node->ir_block] = node->start;
@@ -373,12 +419,23 @@ struct CompactRecovery::Impl {
                 static_cast<double>(view.coverage.exact_blocks) * 100.0 /
                 static_cast<double>(coverage_total));
         }
+        if (view.coverage.total_instructions != 0) {
+            view.coverage.exact_instruction_percent = static_cast<std::uint32_t>(
+                static_cast<double>(view.coverage.exact_instructions) * 100.0 /
+                static_cast<double>(view.coverage.total_instructions));
+        }
 
         std::vector<SemanticStatement> material;
-        std::vector<SemanticStatement> deferred;
         std::vector<SemanticEvidence> material_evidence;
-        std::vector<SemanticEvidence> deferred_evidence;
         std::size_t seen_calls = 0;
+
+        std::unordered_set<xair_value_id> abi_return_values;
+        for (const PresentationVariable& variable : view.returns) {
+            abi_return_values.insert(variable.values.begin(), variable.values.end());
+            if (variable.primary_value != XAIR_INVALID_ID) {
+                abi_return_values.insert(variable.primary_value);
+            }
+        }
 
         for (const xair_cfg_node_id node_id : view.control.block_order) {
             const xair_cfg_node* node = xair_cfg_get_node(&cfg, node_id);
@@ -460,7 +517,7 @@ struct CompactRecovery::Impl {
                             XAIR_TYPE_MEM) {
                             continue;
                         }
-                        result_name = value_text(results[result_index], names, options);
+                        result_name = result_text(results[result_index], names);
                         statement.values.push_back(results[result_index]);
                         break;
                     }
@@ -513,7 +570,7 @@ struct CompactRecovery::Impl {
                 if (raw.opcode == XAIR_OP_LOAD && input_count >= 2 && result_count != 0) {
                     statement.kind = SemanticStatementKind::memory_read;
                     const std::uint16_t bits = xair_value_type(&module, results[0]).bits;
-                    statement.text = value_text(results[0], names, options) + " = load" +
+                    statement.text = result_text(results[0], names) + " = load" +
                         std::to_string(bits) + '(' +
                         value_text(inputs[1], names, options) + ')';
                     statement.values = {inputs[1], results[0]};
@@ -555,7 +612,7 @@ struct CompactRecovery::Impl {
                     if (!constant || (*constant == 0 || *constant == 1)) continue;
                     statement.kind = SemanticStatementKind::constant;
                     statement.values.push_back(results[0]);
-                    statement.text = value_text(results[0], names, options) + " = 0x" +
+                    statement.text = result_text(results[0], names) + " = 0x" +
                         hex_value(*constant);
                     const xair_binary_segment* segment = xair_binary_view_find_segment(
                         &binary, *constant, 0);
@@ -567,8 +624,10 @@ struct CompactRecovery::Impl {
                         statement.kind = SemanticStatementKind::string_reference;
                         statement.text += " \"" + *string + '"';
                     }
-                    append_statement(deferred, std::move(statement), evidence);
-                    deferred_evidence.push_back(std::move(evidence));
+                    /* Constants are emitted at their defining operation.  They
+                     * must not be deferred past a block's terminal transfer. */
+                    append_statement(material, std::move(statement), evidence);
+                    material_evidence.push_back(std::move(evidence));
                 }
             }
 
@@ -598,10 +657,15 @@ struct CompactRecovery::Impl {
             } else if (term.kind == XAIR_TERM_VIEW_RETURN) {
                 statement.kind = SemanticStatementKind::return_value;
                 statement.text = "return";
+                /* XAIR return edges may carry the entire machine state (stack,
+                 * flags, memory) for SSA propagation.  Only values selected by
+                 * ABI-aware variable recovery are source-level return values. */
                 for (std::size_t index = 0; index < term.true_arg_count; ++index) {
-                    statement.text += index == 0 ? " " : ", ";
-                    statement.text += value_text(term.true_args[index], names, options);
-                    statement.values.push_back(term.true_args[index]);
+                    const xair_value_id value = term.true_args[index];
+                    if (!abi_return_values.contains(value)) continue;
+                    statement.text += " " + value_text(value, names, options);
+                    statement.values.push_back(value);
+                    break;
                 }
             } else if (term.kind == XAIR_TERM_VIEW_TRAP) {
                 statement.kind = SemanticStatementKind::trap;
@@ -651,13 +715,6 @@ struct CompactRecovery::Impl {
             append_statement(material, std::move(statement), evidence);
             material_evidence.push_back(std::move(evidence));
         }
-
-        material.insert(material.end(),
-                        std::make_move_iterator(deferred.begin()),
-                        std::make_move_iterator(deferred.end()));
-        material_evidence.insert(material_evidence.end(),
-                                 std::make_move_iterator(deferred_evidence.begin()),
-                                 std::make_move_iterator(deferred_evidence.end()));
 
         const std::size_t keep = options.max_statements == 0
             ? material.size() : std::min(material.size(), options.max_statements);

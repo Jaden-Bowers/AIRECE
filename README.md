@@ -20,8 +20,10 @@ and type retains XAIR evidence and confidence. Phase 5 adds the primary
 budgeted compact function view with stable statement/evidence IDs, calls,
 control, memory, references, unresolved behavior, semantic coverage, and
 continuation hints. Phase 6 adds conservative display-only control regions
-over `xair_cfg` analyses and emits nested `if`, loop, and switch syntax, with
-qualified labels retained as a fallback for irreducible or limited graphs.
+over `xair_cfg` analyses. Pseudocode emits a structured `if` only when both
+arms and their join can be certified; loops, unresolved switches, irreducible
+regions, and limited graphs retain function-qualified labels and gotos. Switch
+destination addresses are never presented as case constants.
 Phase 7 adds a compiled-in, versioned Windows API signature set over
 `xair_sym_model_identity` and model kinds. It annotates arguments, returns,
 constants, effects, taint roles, no-return behavior, and handle relationships;
@@ -76,7 +78,7 @@ out/build/windows-msvc/Release/airece.exe flow sample.exe --source "input=buffer
 out/build/windows-msvc/Release/airece.exe flow sample.exe --source "key=register(rdx)@0x140001020:before" --target "goal=reach@0x140003000" --mode taint-symbolic --function-depth 2 --json
 out/build/windows-msvc/Release/airece.exe path sample.exe --from 0x140001000 --to 0x140001080
 out/build/windows-msvc/Release/airece.exe evidence sample.exe F140001000:S:O16
-python tools/evaluate.py --airece out/build/windows-msvc/Release/airece.exe --manifest C:/path/to/corpus-manifest.json --max-samples 20 --output out/evaluation.json
+python tools/evaluate.py --airece out/build/windows-msvc/Release/airece.exe --manifest C:/path/to/corpus-manifest.json --max-samples 20 --functions-per-binary 5 --output out/evaluation.json
 ```
 
 The AIRECE build disables XAIR's bootstrap decoder and CFG's `fast-x86` and
@@ -128,3 +130,5 @@ CLI stdout contains requested data only; diagnostics go to stderr. Exit codes
 are stable: `0` complete, `1` analysis failure, `2` usage error, and `3` useful
 partial output. JSON diagnostics never appear inside the JSON document. Model
 set version `2.0.0` and all component revisions are reported by `--version`.
+Every successful JSON request emits valid JSON within its byte budget. Budgets
+of two bytes may degrade to `{}`; a smaller budget fails explicitly on stderr.
