@@ -1,0 +1,1 @@
+load64(arg0 + 0x18:bits64) == 0x0:bits64
