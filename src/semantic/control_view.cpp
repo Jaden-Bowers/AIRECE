@@ -5,6 +5,7 @@
 #include <limits>
 #include <mutex>
 #include <set>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -86,6 +87,358 @@ struct ControlRecovery::Impl {
 
     Impl(const xair_cfg& cfg_value, const xair_module& module_value)
         : cfg(cfg_value), module(module_value) {}
+
+    bool constant_i64(const xair_value_id value, std::int64_t& result) const {
+        xair_op_id operation = XAIR_INVALID_ID;
+        xair_op_view_v3 view{};
+        std::uint64_t low = 0;
+        std::uint64_t high = 0;
+        if (xair_value_definition(&module, value, &operation) != XAIR_OK ||
+            operation == XAIR_INVALID_ID ||
+            xair_module_get_op_v3(&module, operation, &view) != XAIR_OK ||
+            view.opcode != XAIR_OP_CONST_U64 ||
+            xair_op_immediate_wide(&module, operation, &low, &high) != XAIR_OK) {
+            return false;
+        }
+        result = static_cast<std::int64_t>(low);
+        return true;
+    }
+
+    bool depends_on(
+        const xair_value_id value,
+        const xair_value_id needle,
+        const std::size_t depth = 0) const {
+        if (value == needle) return true;
+        if (depth >= 16) return false;
+        xair_op_id operation = XAIR_INVALID_ID;
+        const xair_value_id* inputs = nullptr;
+        std::size_t input_count = 0;
+        if (xair_value_definition(&module, value, &operation) != XAIR_OK ||
+            operation == XAIR_INVALID_ID ||
+            xair_op_inputs(&module, operation, &inputs, &input_count) != XAIR_OK) {
+            return false;
+        }
+        for (std::size_t index = 0; index < input_count; ++index) {
+            if (depends_on(inputs[index], needle, depth + 1)) return true;
+        }
+        return false;
+    }
+
+    bool induction_step(
+        const xair_value_id update,
+        const xair_value_id variable,
+        std::int64_t& step) const {
+        xair_op_id operation = XAIR_INVALID_ID;
+        xair_op_view_v3 view{};
+        const xair_value_id* inputs = nullptr;
+        std::size_t input_count = 0;
+        if (xair_value_definition(&module, update, &operation) != XAIR_OK ||
+            operation == XAIR_INVALID_ID ||
+            xair_module_get_op_v3(&module, operation, &view) != XAIR_OK ||
+            xair_op_inputs(&module, operation, &inputs, &input_count) != XAIR_OK) {
+            return false;
+        }
+        if ((view.opcode == XAIR_OP_ZEXT || view.opcode == XAIR_OP_SEXT ||
+             view.opcode == XAIR_OP_TRUNC || view.opcode == XAIR_OP_EXTRACT) &&
+            input_count != 0) {
+            return induction_step(inputs[0], variable, step);
+        }
+        if ((view.opcode != XAIR_OP_ADD && view.opcode != XAIR_OP_SUB) ||
+            input_count < 2) return false;
+        std::int64_t amount = 0;
+        if (depends_on(inputs[0], variable) && constant_i64(inputs[1], amount)) {
+            step = view.opcode == XAIR_OP_SUB ? -amount : amount;
+            return step != 0;
+        }
+        if (view.opcode == XAIR_OP_ADD && depends_on(inputs[1], variable) &&
+            constant_i64(inputs[0], amount)) {
+            step = amount;
+            return step != 0;
+        }
+        return false;
+    }
+
+    std::optional<std::int64_t> stack_offset(
+        const xair_value_id value,
+        const std::size_t depth = 0) const {
+        if (depth >= 16) return std::nullopt;
+        const char* raw_name = xair_value_name(&module, value);
+        if (raw_name != nullptr) {
+            const std::string name(raw_name);
+            if (name == "rsp" || name == "esp" || name == "rbp" || name == "ebp") {
+                return 0;
+            }
+        }
+        xair_op_id operation = XAIR_INVALID_ID;
+        xair_op_view_v3 view{};
+        const xair_value_id* inputs = nullptr;
+        std::size_t input_count = 0;
+        if (xair_value_definition(&module, value, &operation) != XAIR_OK ||
+            operation == XAIR_INVALID_ID ||
+            xair_module_get_op_v3(&module, operation, &view) != XAIR_OK ||
+            xair_op_inputs(&module, operation, &inputs, &input_count) != XAIR_OK) {
+            return std::nullopt;
+        }
+        if ((view.opcode == XAIR_OP_INT_TO_ADDR || view.opcode == XAIR_OP_ADDR_TO_INT ||
+             view.opcode == XAIR_OP_ZEXT || view.opcode == XAIR_OP_SEXT ||
+             view.opcode == XAIR_OP_TRUNC) && input_count != 0) {
+            return stack_offset(inputs[0], depth + 1);
+        }
+        if ((view.opcode == XAIR_OP_ADD || view.opcode == XAIR_OP_SUB ||
+             view.opcode == XAIR_OP_ADDR_ADD || view.opcode == XAIR_OP_ADDR_SUB) &&
+            input_count >= 2) {
+            std::int64_t amount = 0;
+            if (constant_i64(inputs[1], amount)) {
+                const auto base = stack_offset(inputs[0], depth + 1);
+                if (base) {
+                    return *base + ((view.opcode == XAIR_OP_SUB ||
+                        view.opcode == XAIR_OP_ADDR_SUB) ? -amount : amount);
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    xair_value_id find_load(
+        const xair_value_id value,
+        const std::size_t depth = 0) const {
+        if (depth >= 12) return XAIR_INVALID_ID;
+        xair_op_id operation = XAIR_INVALID_ID;
+        xair_op_view_v3 view{};
+        const xair_value_id* inputs = nullptr;
+        std::size_t input_count = 0;
+        if (xair_value_definition(&module, value, &operation) != XAIR_OK ||
+            operation == XAIR_INVALID_ID ||
+            xair_module_get_op_v3(&module, operation, &view) != XAIR_OK ||
+            xair_op_inputs(&module, operation, &inputs, &input_count) != XAIR_OK) {
+            return XAIR_INVALID_ID;
+        }
+        if (view.opcode == XAIR_OP_LOAD) return value;
+        if (view.opcode == XAIR_OP_ZEXT || view.opcode == XAIR_OP_SEXT ||
+            view.opcode == XAIR_OP_TRUNC || view.opcode == XAIR_OP_EXTRACT) {
+            return input_count == 0 ? XAIR_INVALID_ID : find_load(inputs[0], depth + 1);
+        }
+        return XAIR_INVALID_ID;
+    }
+
+    bool stored_induction_step(
+        const xair_value_id data,
+        const std::int64_t offset,
+        std::int64_t& step,
+        const std::size_t depth = 0) const {
+        if (depth >= 12) return false;
+        xair_op_id operation = XAIR_INVALID_ID;
+        xair_op_view_v3 view{};
+        const xair_value_id* inputs = nullptr;
+        std::size_t input_count = 0;
+        if (xair_value_definition(&module, data, &operation) != XAIR_OK ||
+            operation == XAIR_INVALID_ID ||
+            xair_module_get_op_v3(&module, operation, &view) != XAIR_OK ||
+            xair_op_inputs(&module, operation, &inputs, &input_count) != XAIR_OK) {
+            return false;
+        }
+        if ((view.opcode == XAIR_OP_ZEXT || view.opcode == XAIR_OP_SEXT ||
+             view.opcode == XAIR_OP_TRUNC || view.opcode == XAIR_OP_EXTRACT) &&
+            input_count != 0) {
+            return stored_induction_step(inputs[0], offset, step, depth + 1);
+        }
+        if ((view.opcode != XAIR_OP_ADD && view.opcode != XAIR_OP_SUB) ||
+            input_count < 2) return false;
+        for (std::size_t load_side = 0; load_side < 2; ++load_side) {
+            const xair_value_id loaded = find_load(inputs[load_side]);
+            if (loaded == XAIR_INVALID_ID) continue;
+            xair_op_id load_operation = XAIR_INVALID_ID;
+            const xair_value_id* load_inputs = nullptr;
+            std::size_t load_count = 0;
+            if (xair_value_definition(&module, loaded, &load_operation) != XAIR_OK ||
+                xair_op_inputs(&module, load_operation, &load_inputs, &load_count) != XAIR_OK ||
+                load_count < 2 || stack_offset(load_inputs[1]) != offset) continue;
+            std::int64_t amount = 0;
+            if (!constant_i64(inputs[1 - load_side], amount)) continue;
+            if (view.opcode == XAIR_OP_SUB && load_side != 0) continue;
+            step = view.opcode == XAIR_OP_SUB ? -amount : amount;
+            return step != 0;
+        }
+        return false;
+    }
+
+    bool recover_stored_induction(
+        const LoopRecord& loop,
+        const xair_value_id left,
+        const xair_value_id right,
+        const std::string& comparison,
+        ControlRegion& region) const {
+        for (const bool use_left : {true, false}) {
+            const xair_value_id expression = use_left ? left : right;
+            const xair_value_id loaded = find_load(expression);
+            if (loaded == XAIR_INVALID_ID) continue;
+            xair_op_id load_operation = XAIR_INVALID_ID;
+            const xair_value_id* load_inputs = nullptr;
+            std::size_t load_count = 0;
+            if (xair_value_definition(&module, loaded, &load_operation) != XAIR_OK ||
+                xair_op_inputs(&module, load_operation, &load_inputs, &load_count) != XAIR_OK ||
+                load_count < 2) continue;
+            const auto offset = stack_offset(load_inputs[1]);
+            if (!offset) continue;
+            for (const xair_cfg_node_id node_id : loop.members) {
+                const xair_cfg_node* node = xair_cfg_get_node(&cfg, node_id);
+                if (node == nullptr || node->ir_block == XAIR_INVALID_ID) continue;
+                const xair_op_id* operations = nullptr;
+                std::size_t operation_count = 0;
+                if (xair_block_ops(
+                        &module, node->ir_block, &operations, &operation_count) != XAIR_OK) continue;
+                for (std::size_t index = 0; index < operation_count; ++index) {
+                    xair_op_view_v3 view{};
+                    const xair_value_id* inputs = nullptr;
+                    std::size_t input_count = 0;
+                    if (xair_module_get_op_v3(&module, operations[index], &view) != XAIR_OK ||
+                        view.opcode != XAIR_OP_STORE ||
+                        xair_op_inputs(&module, operations[index], &inputs, &input_count) != XAIR_OK ||
+                        input_count < 3 || stack_offset(inputs[1]) != *offset) continue;
+                    std::int64_t step = 0;
+                    if (!stored_induction_step(inputs[2], *offset, step)) continue;
+                    region.induction.recovered = true;
+                    region.induction.variable = loaded;
+                    region.induction.bound = use_left ? right : left;
+                    region.induction.step = step;
+                    region.induction.comparison = comparison;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool comparison_operands(
+        const xair_value_id condition,
+        xair_value_id& left,
+        xair_value_id& right,
+        std::string& comparison) const {
+        xair_op_id operation = XAIR_INVALID_ID;
+        xair_op_view_v3 view{};
+        const xair_value_id* inputs = nullptr;
+        std::size_t input_count = 0;
+        if (xair_value_definition(&module, condition, &operation) != XAIR_OK ||
+            operation == XAIR_INVALID_ID ||
+            xair_module_get_op_v3(&module, operation, &view) != XAIR_OK ||
+            xair_op_inputs(&module, operation, &inputs, &input_count) != XAIR_OK) {
+            return false;
+        }
+        if ((view.opcode == XAIR_OP_EQ || view.opcode == XAIR_OP_NE ||
+             view.opcode == XAIR_OP_XOR) &&
+            input_count >= 2) {
+            std::int64_t boolean_constant = 0;
+            if (constant_i64(inputs[1], boolean_constant) &&
+                xair_value_type(&module, inputs[1]).bits == 1) {
+                return comparison_operands(inputs[0], left, right, comparison);
+            }
+            if (constant_i64(inputs[0], boolean_constant) &&
+                xair_value_type(&module, inputs[0]).bits == 1) {
+                return comparison_operands(inputs[1], left, right, comparison);
+            }
+        }
+        const auto set_direct = [&](const char* name) {
+            if (input_count < 2) return false;
+            left = inputs[0];
+            right = inputs[1];
+            comparison = name;
+            return true;
+        };
+        switch (view.opcode) {
+        case XAIR_OP_EQ: return set_direct("eq");
+        case XAIR_OP_NE: return set_direct("ne");
+        case XAIR_OP_ULT: return set_direct("ult");
+        case XAIR_OP_ULE: return set_direct("ule");
+        case XAIR_OP_SLT: return set_direct("slt");
+        case XAIR_OP_SLE: return set_direct("sle");
+        case XAIR_OP_FLAG_ZF:
+        case XAIR_OP_FLAG_CF:
+            if (input_count == 0) return false;
+            break;
+        default: return false;
+        }
+        xair_op_id flags_operation = XAIR_INVALID_ID;
+        xair_op_view_v3 flags_view{};
+        const xair_value_id* flag_inputs = nullptr;
+        std::size_t flag_count = 0;
+        if (xair_value_definition(&module, inputs[0], &flags_operation) != XAIR_OK ||
+            flags_operation == XAIR_INVALID_ID ||
+            xair_module_get_op_v3(&module, flags_operation, &flags_view) != XAIR_OK ||
+            flags_view.opcode != XAIR_OP_FLAGS_SUB ||
+            xair_op_inputs(&module, flags_operation, &flag_inputs, &flag_count) != XAIR_OK ||
+            flag_count < 2) return false;
+        left = flag_inputs[0];
+        right = flag_inputs[1];
+        comparison = view.opcode == XAIR_OP_FLAG_CF ? "ult" : "eq";
+        return true;
+    }
+
+    xair_value_id edge_argument(
+        const xair_cfg_node_id source,
+        const xair_block_id target,
+        const std::size_t parameter) const {
+        const xair_cfg_node* node = xair_cfg_get_node(&cfg, source);
+        if (node == nullptr || node->ir_block == XAIR_INVALID_ID) return XAIR_INVALID_ID;
+        xair_term_view term{};
+        if (xair_block_terminator(&module, node->ir_block, &term) != XAIR_OK) {
+            return XAIR_INVALID_ID;
+        }
+        if (term.true_target == target && parameter < term.true_arg_count) {
+            return term.true_args[parameter];
+        }
+        if (term.false_target == target && parameter < term.false_arg_count) {
+            return term.false_args[parameter];
+        }
+        return XAIR_INVALID_ID;
+    }
+
+    void recover_induction(
+        const LoopRecord& loop,
+        const std::vector<EdgeRecord>& edges,
+        const std::set<std::pair<xair_cfg_node_id, xair_cfg_node_id>>& back_edges,
+        ControlRegion& region) const {
+        const xair_cfg_node* header_node = xair_cfg_get_node(&cfg, loop.header);
+        if (header_node == nullptr || header_node->ir_block == XAIR_INVALID_ID ||
+            region.condition == XAIR_INVALID_ID) return;
+        xair_value_id left = XAIR_INVALID_ID;
+        xair_value_id right = XAIR_INVALID_ID;
+        std::string comparison;
+        if (!comparison_operands(region.condition, left, right, comparison)) return;
+        const std::size_t parameter_count =
+            xair_block_param_count(&module, header_node->ir_block);
+        for (std::size_t parameter = 0; parameter < parameter_count; ++parameter) {
+            xair_value_id variable = XAIR_INVALID_ID;
+            if (xair_block_param_value(
+                    &module, header_node->ir_block, parameter, &variable) != XAIR_OK) continue;
+            const bool left_depends = depends_on(left, variable);
+            const bool right_depends = depends_on(right, variable);
+            if (left_depends == right_depends) continue;
+            xair_value_id update = XAIR_INVALID_ID;
+            for (const auto& [source, target] : back_edges) {
+                if (target != loop.header || !loop.members.contains(source)) continue;
+                const xair_value_id argument = edge_argument(
+                    source, header_node->ir_block, parameter);
+                if (argument != XAIR_INVALID_ID) update = argument;
+            }
+            std::int64_t step = 0;
+            if (update == XAIR_INVALID_ID || !induction_step(update, variable, step)) continue;
+            xair_value_id initial = XAIR_INVALID_ID;
+            for (const EdgeRecord& edge : edges) {
+                if (edge.edge.dst != loop.header || loop.members.contains(edge.edge.src)) continue;
+                const xair_value_id argument = edge_argument(
+                    edge.edge.src, header_node->ir_block, parameter);
+                if (argument != XAIR_INVALID_ID) initial = argument;
+            }
+            region.induction.recovered = true;
+            region.induction.variable = variable;
+            region.induction.initial = initial;
+            region.induction.bound = left_depends ? right : left;
+            region.induction.step = step;
+            region.induction.comparison = comparison;
+            return;
+        }
+        (void)recover_stored_induction(loop, left, right, comparison, region);
+    }
 
     ControlEvidence node_evidence(const xair_cfg_node_id node_id) const {
         ControlEvidence evidence;
@@ -375,6 +728,7 @@ struct ControlRecovery::Impl {
             else if (header_exit) region.kind = ControlRegionKind::while_loop;
             else if (latch_condition) region.kind = ControlRegionKind::do_while_loop;
             else region.kind = ControlRegionKind::while_loop;
+            recover_induction(loop, edges, back_edges, region);
             add_region(view, std::move(region), options);
             covered.insert(members.begin(), members.end());
         }
@@ -418,9 +772,11 @@ struct ControlRecovery::Impl {
                             XAIR_INDIRECT_RESOLUTION_TRUNCATED |
                             XAIR_INDIRECT_RESOLUTION_BUDGET_LIMITED |
                             XAIR_INDIRECT_RESOLUTION_INVALID_READ;
-                        bool complete = indirect->kind == XAIR_INDIRECT_SWITCH &&
+                        region.switch_values_complete =
+                            indirect->kind == XAIR_INDIRECT_SWITCH &&
                             candidates != nullptr && candidate_count != 0 && bounded &&
-                            span == candidate_count &&
+                            span == candidate_count;
+                        bool complete = region.switch_values_complete &&
                             (indirect->flags & unsafe_flags) == 0;
                         for (std::size_t candidate = 0;
                              candidate < candidate_count; ++candidate) {

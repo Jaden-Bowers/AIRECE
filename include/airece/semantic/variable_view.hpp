@@ -90,6 +90,7 @@ struct PresentationVariable {
     VariableEvidence evidence;
     std::uint64_t address{};
     std::int64_t stack_offset{};
+    std::size_t argument_index{static_cast<std::size_t>(-1)};
     std::uint16_t storage_bits{};
     bool storage_identity{};
     bool overlaps_uncertain{};

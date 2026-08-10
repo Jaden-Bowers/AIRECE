@@ -238,8 +238,23 @@ struct CompactRecovery::Impl {
         expression_options.max_nodes = 64;
         expression_options.max_tokens = 96;
         expression_options.max_characters = 384;
-        const SemanticExpression expression = expressions.build(value, expression_options);
+        const SemanticExpression expression =
+            expressions.build_named(value, names, expression_options);
         return expression ? expression.text : "v" + std::to_string(value);
+    }
+
+    std::vector<xair_value_id> value_dependencies(
+        const xair_value_id value,
+        const std::unordered_map<xair_value_id, std::string>& names,
+        const CompactOptions& options) const {
+        ExpressionOptions expression_options;
+        expression_options.max_depth = options.max_expression_depth;
+        expression_options.max_nodes = 64;
+        expression_options.max_tokens = 96;
+        expression_options.max_characters = 384;
+        const SemanticExpression expression =
+            expressions.build_named(value, names, expression_options);
+        return expression.referenced_values;
     }
 
     static std::string result_text(
@@ -410,6 +425,45 @@ struct CompactRecovery::Impl {
                 block_addresses[node->ir_block] = node->start;
             }
         }
+
+        std::unordered_map<xair_value_id, xair_value_id> copy_sources;
+        std::unordered_set<xair_value_id> conflicting_copies;
+        const auto record_block_arguments = [&](const xair_block_id target,
+                                                const xair_value_id* arguments,
+                                                const std::size_t argument_count) {
+            if (!block_nodes.contains(target) || arguments == nullptr) return;
+            const std::size_t count = std::min(
+                xair_block_param_count(&module, target), argument_count);
+            for (std::size_t index = 0; index < count; ++index) {
+                xair_value_id parameter = XAIR_INVALID_ID;
+                if (xair_block_param_value(&module, target, index, &parameter) != XAIR_OK ||
+                    conflicting_copies.contains(parameter)) continue;
+                const auto existing = copy_sources.find(parameter);
+                if (existing == copy_sources.end()) {
+                    copy_sources.emplace(parameter, arguments[index]);
+                } else if (existing->second != arguments[index]) {
+                    copy_sources.erase(existing);
+                    conflicting_copies.insert(parameter);
+                }
+            }
+        };
+        for (const auto& [block, node_id] : block_nodes) {
+            (void)node_id;
+            xair_term_view term{};
+            if (xair_block_terminator(&module, block, &term) != XAIR_OK) continue;
+            record_block_arguments(term.true_target, term.true_args, term.true_arg_count);
+            record_block_arguments(term.false_target, term.false_args, term.false_arg_count);
+        }
+        const auto resolve_copy = [&](xair_value_id value) {
+            std::unordered_set<xair_value_id> seen;
+            while (seen.insert(value).second) {
+                const auto found = copy_sources.find(value);
+                if (found == copy_sources.end() || found->second == value) break;
+                value = found->second;
+            }
+            return value;
+        };
+
         /* XAIR block parameters are SSA versions of values crossing CFG edges.
          * Carry presentation identities through those edge arguments so an
          * entry ABI argument remains argN instead of reverting to rcx/rdx/r8/r9. */
@@ -426,19 +480,211 @@ struct CompactRecovery::Impl {
                     const std::size_t parameter_count = xair_block_param_count(&module, target);
                     const std::size_t count = std::min(parameter_count, argument_count);
                     for (std::size_t index = 0; index < count; ++index) {
-                        const auto source_name = names.find(arguments[index]);
+                        const auto source_name = names.find(
+                            resolve_copy(arguments[index]));
                         if (source_name == names.end()) continue;
                         xair_value_id parameter = XAIR_INVALID_ID;
                         if (xair_block_param_value(&module, target, index, &parameter) != XAIR_OK) {
                             continue;
                         }
-                        changed = names.emplace(parameter, source_name->second).second || changed;
+                        const auto current = names.find(parameter);
+                        if (current == names.end() || current->second != source_name->second) {
+                            names[parameter] = source_name->second;
+                            changed = true;
+                        }
                     }
                 };
                 propagate(term.true_target, term.true_args, term.true_arg_count);
                 propagate(term.false_target, term.false_args, term.false_arg_count);
             }
             if (!changed) break;
+        }
+
+        /* Normalize stack addresses against the function-entry stack pointer.
+         * This preserves one storage identity across prologue adjustment and
+         * CFG block parameters, including ordinary argument spills. */
+        std::unordered_map<xair_value_id, std::int64_t> storage_offsets;
+        for (const auto& [block, node_id] : block_nodes) {
+            const xair_cfg_node* node = xair_cfg_get_node(&cfg, node_id);
+            if (node == nullptr || node->start != function.entry) continue;
+            const std::size_t parameter_count = xair_block_param_count(&module, block);
+            for (std::size_t index = 0; index < parameter_count; ++index) {
+                xair_value_id parameter = XAIR_INVALID_ID;
+                if (xair_block_param_value(&module, block, index, &parameter) != XAIR_OK) {
+                    continue;
+                }
+                const char* raw_name = xair_value_name(&module, parameter);
+                if (raw_name != nullptr &&
+                    (std::string_view(raw_name) == "rsp" ||
+                     std::string_view(raw_name) == "esp")) {
+                    storage_offsets.emplace(parameter, 0);
+                }
+            }
+        }
+        for (std::size_t pass = 0; pass < 32; ++pass) {
+            bool changed = false;
+            for (const auto& [block, node_id] : block_nodes) {
+                (void)node_id;
+                const xair_op_id* operations = nullptr;
+                std::size_t operation_count = 0;
+                if (xair_block_ops(&module, block, &operations, &operation_count) != XAIR_OK) {
+                    continue;
+                }
+                for (std::size_t index = 0; index < operation_count; ++index) {
+                    xair_op_view_v3 operation{};
+                    const xair_value_id* inputs = nullptr;
+                    const xair_value_id* results = nullptr;
+                    std::size_t input_count = 0;
+                    std::size_t result_count = 0;
+                    if (xair_module_get_op_v3(&module, operations[index], &operation) != XAIR_OK ||
+                        xair_op_inputs(&module, operations[index], &inputs, &input_count) != XAIR_OK ||
+                        xair_op_results(&module, operations[index], &results, &result_count) != XAIR_OK ||
+                        result_count == 0) continue;
+                    std::optional<std::int64_t> offset;
+                    if ((operation.opcode == XAIR_OP_INT_TO_ADDR ||
+                         operation.opcode == XAIR_OP_ADDR_TO_INT ||
+                         operation.opcode == XAIR_OP_ZEXT ||
+                         operation.opcode == XAIR_OP_SEXT ||
+                         operation.opcode == XAIR_OP_TRUNC) && input_count != 0) {
+                        const auto found = storage_offsets.find(inputs[0]);
+                        if (found != storage_offsets.end()) offset = found->second;
+                    } else if ((operation.opcode == XAIR_OP_ADD ||
+                                operation.opcode == XAIR_OP_SUB ||
+                                operation.opcode == XAIR_OP_ADDR_ADD ||
+                                operation.opcode == XAIR_OP_ADDR_SUB) && input_count >= 2) {
+                        const auto found = storage_offsets.find(inputs[0]);
+                        const auto amount = constant_value(inputs[1]);
+                        if (found != storage_offsets.end() && amount) {
+                            const auto signed_amount = static_cast<std::int64_t>(*amount);
+                            offset = found->second +
+                                ((operation.opcode == XAIR_OP_SUB ||
+                                  operation.opcode == XAIR_OP_ADDR_SUB)
+                                    ? -signed_amount : signed_amount);
+                        }
+                    }
+                    if (offset) {
+                        for (std::size_t result = 0; result < result_count; ++result) {
+                            changed = storage_offsets.emplace(
+                                results[result], *offset).second || changed;
+                        }
+                    }
+                }
+                xair_term_view term{};
+                if (xair_block_terminator(&module, block, &term) != XAIR_OK) continue;
+                const auto propagate_offsets = [&](const xair_block_id target,
+                                                   const xair_value_id* arguments,
+                                                   const std::size_t argument_count) {
+                    if (!block_nodes.contains(target) || arguments == nullptr) return;
+                    const std::size_t count = std::min(
+                        xair_block_param_count(&module, target), argument_count);
+                    for (std::size_t index = 0; index < count; ++index) {
+                        const auto source = storage_offsets.find(arguments[index]);
+                        if (source == storage_offsets.end()) continue;
+                        xair_value_id parameter = XAIR_INVALID_ID;
+                        if (xair_block_param_value(&module, target, index, &parameter) == XAIR_OK) {
+                            changed = storage_offsets.emplace(
+                                parameter, source->second).second || changed;
+                        }
+                    }
+                };
+                propagate_offsets(term.true_target, term.true_args, term.true_arg_count);
+                propagate_offsets(term.false_target, term.false_args, term.false_arg_count);
+            }
+            if (!changed) break;
+        }
+
+        const auto same_storage_address = [&](const xair_value_id left,
+                                              const xair_value_id right) {
+            if (resolve_copy(left) == resolve_copy(right)) return true;
+            const auto left_offset = storage_offsets.find(left);
+            const auto right_offset = storage_offsets.find(right);
+            if (left_offset != storage_offsets.end() &&
+                right_offset != storage_offsets.end() &&
+                left_offset->second == right_offset->second) return true;
+            const auto left_name = names.find(left);
+            const auto right_name = names.find(right);
+            return left_name != names.end() && right_name != names.end() &&
+                left_name->second.starts_with('&') &&
+                left_name->second == right_name->second;
+        };
+        const auto stored_value = [&](xair_value_id memory,
+                                      const xair_value_id address) {
+            std::unordered_set<xair_value_id> seen;
+            for (std::size_t depth = 0; depth < 128 && seen.insert(memory).second;
+                 ++depth) {
+                memory = resolve_copy(memory);
+                xair_op_id definition = XAIR_INVALID_ID;
+                xair_op_view_v3 operation{};
+                const xair_value_id* inputs = nullptr;
+                std::size_t input_count = 0;
+                if (xair_value_definition(&module, memory, &definition) != XAIR_OK ||
+                    definition == XAIR_INVALID_ID ||
+                    xair_module_get_op_v3(&module, definition, &operation) != XAIR_OK ||
+                    xair_op_inputs(&module, definition, &inputs, &input_count) != XAIR_OK) {
+                    break;
+                }
+                if (operation.opcode == XAIR_OP_STORE && input_count >= 3) {
+                    if (same_storage_address(inputs[1], address)) return inputs[2];
+                    memory = inputs[0];
+                    continue;
+                }
+                break;
+            }
+            return XAIR_INVALID_ID;
+        };
+        const auto resolve_identity = [&](xair_value_id value) {
+            std::unordered_set<xair_value_id> seen;
+            while (value != XAIR_INVALID_ID && seen.insert(value).second) {
+                value = resolve_copy(value);
+                xair_op_id definition = XAIR_INVALID_ID;
+                xair_op_view_v3 operation{};
+                const xair_value_id* inputs = nullptr;
+                std::size_t input_count = 0;
+                if (xair_value_definition(&module, value, &definition) != XAIR_OK ||
+                    definition == XAIR_INVALID_ID ||
+                    xair_module_get_op_v3(&module, definition, &operation) != XAIR_OK ||
+                    xair_op_inputs(&module, definition, &inputs, &input_count) != XAIR_OK ||
+                    input_count == 0 ||
+                    (operation.opcode != XAIR_OP_ZEXT &&
+                     operation.opcode != XAIR_OP_SEXT &&
+                     operation.opcode != XAIR_OP_TRUNC &&
+                     operation.opcode != XAIR_OP_EXTRACT &&
+                     operation.opcode != XAIR_OP_INT_TO_ADDR &&
+                     operation.opcode != XAIR_OP_ADDR_TO_INT)) break;
+                value = inputs[0];
+            }
+            return value;
+        };
+        for (const auto& [block, node_id] : block_nodes) {
+            (void)node_id;
+            const xair_op_id* operations = nullptr;
+            std::size_t operation_count = 0;
+            if (xair_block_ops(&module, block, &operations, &operation_count) != XAIR_OK) {
+                continue;
+            }
+            for (std::size_t index = 0; index < operation_count; ++index) {
+                xair_op_view_v3 operation{};
+                const xair_value_id* inputs = nullptr;
+                const xair_value_id* results = nullptr;
+                std::size_t input_count = 0;
+                std::size_t result_count = 0;
+                if (xair_module_get_op_v3(&module, operations[index], &operation) != XAIR_OK ||
+                    operation.opcode != XAIR_OP_LOAD ||
+                    xair_op_inputs(&module, operations[index], &inputs, &input_count) != XAIR_OK ||
+                    xair_op_results(&module, operations[index], &results, &result_count) != XAIR_OK ||
+                    input_count < 2 || result_count == 0) continue;
+                const xair_value_id source = stored_value(inputs[0], inputs[1]);
+                const auto source_name = names.find(resolve_identity(source));
+                if (source != XAIR_INVALID_ID && source_name != names.end() &&
+                    !source_name->second.starts_with('&')) {
+                    names[results[0]] = source_name->second;
+                    continue;
+                }
+                const auto address_name = names.find(inputs[1]);
+                if (address_name != names.end() && address_name->second.starts_with('&')) {
+                    names[results[0]] = address_name->second.substr(1) + "_value";
+                }
+            }
         }
         const std::size_t coverage_total = view.coverage.exact_blocks +
             view.coverage.partial_blocks + view.coverage.opaque_blocks;
@@ -680,6 +926,8 @@ struct CompactRecovery::Impl {
             if (term.kind == XAIR_TERM_VIEW_CBRANCH) {
                 statement.kind = SemanticStatementKind::branch;
                 statement.values.push_back(term.condition);
+                statement.dependencies = value_dependencies(
+                    term.condition, names, options);
                 statement.text = "if " + value_text(term.condition, names, options) +
                     " -> " + target_for(term.true_target, block_addresses,
                                          all_block_addresses) +
@@ -705,8 +953,18 @@ struct CompactRecovery::Impl {
                 for (std::size_t index = 0; index < term.true_arg_count; ++index) {
                     const xair_value_id value = term.true_args[index];
                     if (!abi_return_values.contains(value)) continue;
-                    statement.text += " " + value_text(value, names, options);
-                    statement.values.push_back(value);
+                    const xair_value_id expression_value = resolve_copy(value);
+                    auto expression_names = names;
+                    const auto presentation = expression_names.find(expression_value);
+                    if (presentation != expression_names.end() &&
+                        presentation->second.starts_with("return_value")) {
+                        expression_names.erase(presentation);
+                    }
+                    statement.text += " " + value_text(
+                        expression_value, expression_names, options);
+                    statement.values.push_back(expression_value);
+                    statement.dependencies = value_dependencies(
+                        expression_value, expression_names, options);
                     break;
                 }
             } else if (term.kind == XAIR_TERM_VIEW_TRAP) {

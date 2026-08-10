@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 extern "C" {
@@ -82,6 +83,10 @@ public:
 
     [[nodiscard]] SemanticExpression build(
         xair_value_id value,
+        const ExpressionOptions& options = {}) const;
+    [[nodiscard]] SemanticExpression build_named(
+        xair_value_id value,
+        const std::unordered_map<xair_value_id, std::string>& value_names,
         const ExpressionOptions& options = {}) const;
     [[nodiscard]] std::size_t cache_size() const noexcept;
     void clear_cache() const;

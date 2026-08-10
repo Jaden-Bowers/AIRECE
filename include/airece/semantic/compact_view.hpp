@@ -55,6 +55,7 @@ struct SemanticStatement {
     xair_block_id block{XAIR_INVALID_ID};
     std::vector<xair_op_id> operations;
     std::vector<xair_value_id> values;
+    std::vector<xair_value_id> dependencies;
     std::string evidence_id;
     std::string api_model;
     std::vector<std::string> api_arguments;

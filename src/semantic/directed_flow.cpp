@@ -26,10 +26,14 @@ struct Tag {
     std::size_t begin{};
     std::size_t end{};
     std::size_t call_depth{};
+    bool storage{};
+    bool storage_exact{};
+    std::int64_t storage_offset{};
     std::vector<std::string> transforms;
 };
 
 using Tags = std::unordered_map<xair_value_id, std::vector<Tag>>;
+using StorageOffsets = std::unordered_map<xair_value_id, std::int64_t>;
 
 struct OperationRecord {
     xair_function_id function{XAIR_CFG_INVALID_FUNCTION};
@@ -153,8 +157,9 @@ bool value_is_scalar(const xair_module& module, const xair_value_id value) {
 
 bool value_is_propagatable(const xair_module& module, const xair_value_id value) {
     const xair_type type = xair_value_type(&module, value);
-    return (type.kind == XAIR_TYPE_INT || type.kind == XAIR_TYPE_ADDR ||
-        type.kind == XAIR_TYPE_FLAGS) && type.bits != 0;
+    return type.kind == XAIR_TYPE_MEM ||
+        ((type.kind == XAIR_TYPE_INT || type.kind == XAIR_TYPE_ADDR ||
+          type.kind == XAIR_TYPE_FLAGS) && type.bits != 0);
 }
 
 std::string value_name(const xair_module& module, const xair_value_id value) {
@@ -200,6 +205,42 @@ std::optional<std::uint64_t> constant_value(
     const xair_value_id value) {
     std::unordered_set<xair_value_id> active;
     return constant_value(module, value, active);
+}
+
+std::optional<std::int64_t> stack_storage_offset(
+    const xair_module& module,
+    const xair_value_id value,
+    const std::size_t depth = 0) {
+    if (depth >= 16) return std::nullopt;
+    const std::string name = value_name(module, value);
+    if (name == "rsp" || name == "esp" || name == "rbp" || name == "ebp") return 0;
+    xair_op_id operation = XAIR_INVALID_ID;
+    xair_op_view_v3 op{};
+    const xair_value_id* inputs = nullptr;
+    std::size_t input_count = 0;
+    if (xair_value_definition(&module, value, &operation) != XAIR_OK ||
+        operation == XAIR_INVALID_ID ||
+        xair_module_get_op_v3(&module, operation, &op) != XAIR_OK ||
+        xair_op_inputs(&module, operation, &inputs, &input_count) != XAIR_OK) {
+        return std::nullopt;
+    }
+    if ((op.opcode == XAIR_OP_INT_TO_ADDR || op.opcode == XAIR_OP_ADDR_TO_INT ||
+         op.opcode == XAIR_OP_ZEXT || op.opcode == XAIR_OP_SEXT ||
+         op.opcode == XAIR_OP_TRUNC) && input_count != 0) {
+        return stack_storage_offset(module, inputs[0], depth + 1);
+    }
+    if ((op.opcode == XAIR_OP_ADD || op.opcode == XAIR_OP_SUB ||
+         op.opcode == XAIR_OP_ADDR_ADD || op.opcode == XAIR_OP_ADDR_SUB) &&
+        input_count >= 2) {
+        const auto amount = constant_value(module, inputs[1]);
+        const auto base = stack_storage_offset(module, inputs[0], depth + 1);
+        if (amount && base) {
+            const auto signed_amount = static_cast<std::int64_t>(*amount);
+            return *base + ((op.opcode == XAIR_OP_SUB || op.opcode == XAIR_OP_ADDR_SUB)
+                ? -signed_amount : signed_amount);
+        }
+    }
+    return std::nullopt;
 }
 
 std::vector<xair_op_id> operations_at(
@@ -282,7 +323,9 @@ bool add_tag(
     auto& values = tags[value];
     for (Tag& existing : values) {
         if (existing.source != incoming.source || existing.pointer != incoming.pointer ||
-            existing.bytes != incoming.bytes) continue;
+            existing.bytes != incoming.bytes || existing.storage != incoming.storage ||
+            existing.storage_exact != incoming.storage_exact ||
+            existing.storage_offset != incoming.storage_offset) continue;
         const std::size_t old_begin = existing.begin;
         const std::size_t old_end = existing.end;
         const std::size_t old_depth = existing.call_depth;
@@ -583,6 +626,110 @@ std::vector<OperationRecord> collect_operations(
     return result;
 }
 
+StorageOffsets recover_storage_offsets(
+    const xair_cfg& cfg,
+    const xair_module& module,
+    const std::vector<OperationRecord>& operations) {
+    StorageOffsets offsets;
+    std::vector<std::size_t> incoming(xair_cfg_node_count(&cfg), 0);
+    for (std::size_t index = 0; index < xair_cfg_edge_count(&cfg); ++index) {
+        const xair_cfg_edge* edge = xair_cfg_get_edge(
+            &cfg, static_cast<xair_cfg_edge_id>(index));
+        if (edge == nullptr || edge->dst >= incoming.size() ||
+            edge->kind == XAIR_EDGE_CALL || edge->kind == XAIR_EDGE_INDIRECT_CALL ||
+            edge->kind == XAIR_EDGE_EXTERNAL) continue;
+        ++incoming[edge->dst];
+    }
+    for (std::size_t index = 0; index < incoming.size(); ++index) {
+        if (incoming[index] != 0) continue;
+        const xair_cfg_node* node = xair_cfg_get_node(
+            &cfg, static_cast<xair_cfg_node_id>(index));
+        if (node == nullptr || node->ir_block == XAIR_INVALID_ID) continue;
+        const std::size_t parameter_count = xair_block_param_count(&module, node->ir_block);
+        for (std::size_t parameter = 0; parameter < parameter_count; ++parameter) {
+            xair_value_id value = XAIR_INVALID_ID;
+            if (xair_block_param_value(&module, node->ir_block, parameter, &value) != XAIR_OK) {
+                continue;
+            }
+            const std::string name = value_name(module, value);
+            if (name == "rsp" || name == "esp") offsets.emplace(value, 0);
+        }
+    }
+    for (std::size_t pass = 0; pass < 32; ++pass) {
+        bool changed = false;
+        for (const OperationRecord& record : operations) {
+            xair_op_view_v3 op{};
+            const xair_value_id* inputs = nullptr;
+            const xair_value_id* results = nullptr;
+            std::size_t input_count = 0;
+            std::size_t result_count = 0;
+            if (xair_module_get_op_v3(&module, record.operation, &op) != XAIR_OK ||
+                xair_op_inputs(&module, record.operation, &inputs, &input_count) != XAIR_OK ||
+                xair_op_results(&module, record.operation, &results, &result_count) != XAIR_OK ||
+                result_count == 0) continue;
+            std::optional<std::int64_t> recovered;
+            if ((op.opcode == XAIR_OP_INT_TO_ADDR || op.opcode == XAIR_OP_ADDR_TO_INT ||
+                 op.opcode == XAIR_OP_ZEXT || op.opcode == XAIR_OP_SEXT ||
+                 op.opcode == XAIR_OP_TRUNC) && input_count != 0) {
+                const auto found = offsets.find(inputs[0]);
+                if (found != offsets.end()) recovered = found->second;
+            } else if ((op.opcode == XAIR_OP_ADD || op.opcode == XAIR_OP_SUB ||
+                        op.opcode == XAIR_OP_ADDR_ADD || op.opcode == XAIR_OP_ADDR_SUB) &&
+                       input_count >= 2) {
+                const auto found = offsets.find(inputs[0]);
+                const auto amount = constant_value(module, inputs[1]);
+                if (found != offsets.end() && amount) {
+                    const auto signed_amount = static_cast<std::int64_t>(*amount);
+                    recovered = found->second +
+                        ((op.opcode == XAIR_OP_SUB || op.opcode == XAIR_OP_ADDR_SUB)
+                            ? -signed_amount : signed_amount);
+                }
+            }
+            if (recovered) {
+                for (std::size_t result = 0; result < result_count; ++result) {
+                    changed = offsets.emplace(results[result], *recovered).second || changed;
+                }
+            }
+        }
+        const std::size_t node_count = xair_cfg_node_count(&cfg);
+        for (std::size_t node_index = 0; node_index < node_count; ++node_index) {
+            const xair_cfg_node* node = xair_cfg_get_node(
+                &cfg, static_cast<xair_cfg_node_id>(node_index));
+            if (node == nullptr || node->ir_block == XAIR_INVALID_ID) continue;
+            xair_term_view term{};
+            if (xair_block_terminator(&module, node->ir_block, &term) != XAIR_OK) continue;
+            const auto propagate = [&](const xair_block_id target,
+                                       const xair_value_id* arguments,
+                                       const std::size_t argument_count) {
+                if (target == XAIR_INVALID_ID || arguments == nullptr) return;
+                const std::size_t count = std::min(
+                    xair_block_param_count(&module, target), argument_count);
+                for (std::size_t parameter = 0; parameter < count; ++parameter) {
+                    const auto source = offsets.find(arguments[parameter]);
+                    if (source == offsets.end()) continue;
+                    xair_value_id value = XAIR_INVALID_ID;
+                    if (xair_block_param_value(&module, target, parameter, &value) == XAIR_OK) {
+                        changed = offsets.emplace(value, source->second).second || changed;
+                    }
+                }
+            };
+            propagate(term.true_target, term.true_args, term.true_arg_count);
+            propagate(term.false_target, term.false_args, term.false_arg_count);
+        }
+        if (!changed) break;
+    }
+    return offsets;
+}
+
+std::optional<std::int64_t> resolved_storage_offset(
+    const StorageOffsets& offsets,
+    const xair_module& module,
+    const xair_value_id value) {
+    const auto found = offsets.find(value);
+    return found == offsets.end() ? stack_storage_offset(module, value)
+                                  : std::optional(found->second);
+}
+
 const FunctionInfo* direct_callee(
     AnalysisSession& session,
     const xair_module& module,
@@ -611,6 +758,7 @@ bool propagate_operation(
     AnalysisSession& session,
     const OperationRecord& record,
     const std::vector<ResolvedFlowPoint>& sources,
+    const StorageOffsets& storage_offsets,
     Tags& tags,
     DirectedFlowResult& result,
     const FlowOptions& options) {
@@ -675,17 +823,42 @@ bool propagate_operation(
 
     std::vector<Tag> merged;
     for (std::size_t index = 0; index < input_count; ++index) {
+        if (op.opcode == XAIR_OP_STORE && index == 1) continue;
         const auto found = tags.find(inputs[index]);
         if (found == tags.end()) continue;
-        merged.insert(merged.end(), found->second.begin(), found->second.end());
+        for (Tag tag : found->second) {
+            if (op.opcode == XAIR_OP_STORE && index == 2) {
+                const auto offset = input_count >= 2
+                    ? resolved_storage_offset(storage_offsets, module, inputs[1])
+                    : std::nullopt;
+                tag.storage = true;
+                tag.storage_exact = offset.has_value();
+                tag.storage_offset = offset.value_or(0);
+                append_transform(tag, "store");
+            }
+            merged.push_back(std::move(tag));
+        }
     }
     if (merged.empty()) return changed;
 
     if (op.opcode == XAIR_OP_LOAD) {
+        const auto load_offset = input_count >= 2
+            ? resolved_storage_offset(storage_offsets, module, inputs[1])
+            : std::nullopt;
+        merged.erase(std::remove_if(merged.begin(), merged.end(),
+            [&](const Tag& tag) {
+                return tag.storage && tag.storage_exact && load_offset &&
+                    tag.storage_offset != *load_offset;
+            }), merged.end());
         const std::uint16_t width_bits = output_count == 0
             ? 0 : xair_value_type(&module, outputs[0]).bits;
         const std::size_t width = std::max<std::size_t>(1, (width_bits + 7U) / 8U);
         for (Tag& tag : merged) {
+            if (tag.storage) {
+                tag.storage = false;
+                append_transform(tag, "load");
+                continue;
+            }
             if (!tag.pointer || !tag.bytes) continue;
             tag.pointer = false;
             const std::size_t requested_length = source_length(sources, tag.source);
@@ -811,8 +984,13 @@ void seed_absolute_memory(
                 const std::size_t begin = static_cast<std::size_t>(*address - selector.memory_address);
                 const std::size_t width = std::max<std::size_t>(1,
                     (xair_value_type(&module, outputs[output]).bits + 7U) / 8U);
-                Tag tag{source_index, true, false, true, begin,
-                    std::min(selector.length - 1, begin + width - 1), 0, {"load"}};
+                Tag tag;
+                tag.source = source_index;
+                tag.bytes = true;
+                tag.exact_offset = true;
+                tag.begin = begin;
+                tag.end = std::min(selector.length - 1, begin + width - 1);
+                tag.transforms.push_back("load");
                 (void)add_tag(tags, outputs[output], std::move(tag), result.states,
                     options.max_states);
             }
@@ -1481,14 +1659,16 @@ DirectedFlowResult directed_flow(
     }
     const std::vector<OperationRecord> operations = collect_operations(
         session.cfg(), *session.module());
+    const StorageOffsets storage_offsets = recover_storage_offsets(
+        session.cfg(), *session.module(), operations);
     seed_absolute_memory(*session.module(), operations, result.sources, tags, result, options);
 
     bool changed = true;
     while (changed && !stopped(result, options, started)) {
         changed = false;
         for (const OperationRecord& operation : operations) {
-            changed = propagate_operation(session, operation, result.sources, tags, result,
-                options) || changed;
+            changed = propagate_operation(session, operation, result.sources,
+                storage_offsets, tags, result, options) || changed;
             if (stopped(result, options, started)) break;
         }
         if (!stopped(result, options, started)) {

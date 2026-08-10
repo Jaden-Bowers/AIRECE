@@ -60,7 +60,11 @@ std::string render_semantic_json(
             out << ",\"type\":"; quoted(out, variable.type.text);
             out << ",\"type_kind\":";
             quoted(out, presentation_type_kind_name(variable.type.kind));
-            out << ",\"roles\":" << variable.roles << ",\"values\":[";
+            out << ",\"roles\":" << variable.roles <<
+                ",\"argument_index\":";
+            if (variable.argument_index == static_cast<std::size_t>(-1)) out << "null";
+            else out << variable.argument_index;
+            out << ",\"values\":[";
             for (std::size_t value = 0; value < variable.values.size(); ++value) {
                 if (value != 0) out << ',';
                 out << variable.values[value];
@@ -141,6 +145,11 @@ std::string render_semantic_json(
             if (value != 0) out << ',';
             out << statement.values[value];
         }
+        out << "],\"dependencies\":[";
+        for (std::size_t value = 0; value < statement.dependencies.size(); ++value) {
+            if (value != 0) out << ',';
+            out << statement.dependencies[value];
+        }
         out << "]}";
     }
     out << "],\"evidence\":[";
@@ -179,7 +188,17 @@ std::string render_semantic_json(
             ",\"condition\":" << region.condition <<
             ",\"switch_mapping_complete\":" <<
                 (region.switch_mapping_complete ? "true" : "false") <<
-            ",\"switch_cases\":[";
+            ",\"switch_values_complete\":" <<
+                (region.switch_values_complete ? "true" : "false") <<
+            ",\"induction\":{\"recovered\":" <<
+                (region.induction.recovered ? "true" : "false") <<
+            ",\"variable\":" << region.induction.variable <<
+            ",\"initial\":" << region.induction.initial <<
+            ",\"bound\":" << region.induction.bound <<
+            ",\"step\":" << region.induction.step <<
+            ",\"comparison\":";
+        quoted(out, region.induction.comparison);
+        out << "},\"switch_cases\":[";
         for (std::size_t item = 0; item < region.switch_cases.size(); ++item) {
             if (item != 0) out << ',';
             out << "{\"value\":" << region.switch_cases[item].value <<

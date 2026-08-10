@@ -80,6 +80,19 @@ AIRECE_EXPORT int airece_semantic_storage(int input) {
     return slot;
 }
 
+AIRECE_EXPORT int airece_semantic_transform(int input) {
+    return input * 7 + 3;
+}
+
+AIRECE_EXPORT int airece_semantic_interproc(int input) {
+    return airece_semantic_transform(input);
+}
+
+AIRECE_EXPORT int airece_semantic_memory_flow(int* output, int input) {
+    *output = input + 5;
+    return *output;
+}
+
 /* A CRT-free DLL entry seeds CFG discovery and keeps all three semantic
  * contracts reachable.  It is analyzed, never loaded or executed by tests. */
 AIRECE_EXPORT int airece_semantic_entry(void) {
@@ -89,5 +102,7 @@ AIRECE_EXPORT int airece_semantic_entry(void) {
         airece_semantic_switch((unsigned)value) +
         airece_semantic_dense_switch((unsigned)value) +
         airece_semantic_loop((const int*)&value, 1) +
-        airece_semantic_storage((int)value);
+        airece_semantic_storage((int)value) +
+        airece_semantic_interproc((int)value) +
+        airece_semantic_memory_flow((int*)&value, (int)value);
 }

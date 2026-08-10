@@ -104,11 +104,26 @@ def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
         "airece_semantic_load", "airece_semantic_branch",
         "airece_semantic_switch", "airece_semantic_dense_switch",
         "airece_semantic_loop", "airece_semantic_storage",
+        "airece_semantic_transform", "airece_semantic_interproc",
+        "airece_semantic_memory_flow",
     }
     missing = expected - exports.keys()
     if missing:
         raise AssertionError(f"compiler fixture exports not discovered: {sorted(missing)}")
 
+    expected_arguments = {
+        "airece_semantic_load": 1,
+        "airece_semantic_branch": 1,
+        "airece_semantic_switch": 1,
+        "airece_semantic_dense_switch": 1,
+        "airece_semantic_loop": 2,
+        "airece_semantic_storage": 1,
+        "airece_semantic_transform": 1,
+        "airece_semantic_interproc": 1,
+        "airece_semantic_memory_flow": 2,
+    }
+    documents: dict[str, dict[str, object]] = {}
+    optimized = "opt" in fixture.stem or "o2" in fixture.stem
     for name in sorted(expected):
         address = exports[name]
         document = json.loads(run(
@@ -116,6 +131,14 @@ def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
             "--profile", "fast", "--max-bytes", "65536",
             "--max-statements", "256", "--max-evidence", "256",
         ))
+        documents[name] = document
+        parameters = document.get("parameters", [])
+        argument_indices = sorted(parameter["argument_index"] for parameter in parameters)
+        wanted = list(range(expected_arguments[name]))
+        if argument_indices != wanted:
+            raise AssertionError(
+                f"wrong parameter identity/count for {name}: "
+                f"expected {wanted}, got {argument_indices}")
         statements = document["statements"]
         by_node: dict[int, list[dict[str, object]]] = {}
         for statement in statements:
@@ -152,6 +175,37 @@ def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
                 raise AssertionError(
                     f"storage fixture lacks an address-qualified stack identity: {memory_text}")
 
+        if (name == "airece_semantic_branch" and optimized and
+                fixture.name == "airece-semantic-source-fixture-opt.dll"):
+            predicates = [statement for statement in statements
+                          if statement["kind"] == "branch" and
+                          statement["values"]]
+            if not predicates or not any("arg0" in statement["text"]
+                                         for statement in predicates):
+                raise AssertionError(
+                    f"optimized branch predicate lost its arg0 dependency: {predicates}")
+
+        if (name == "airece_semantic_loop" and not optimized and
+                fixture.name == "airece-semantic-source-fixture.dll"):
+            inductions = [region["induction"] for region in document["control"]["regions"]
+                          if region["kind"] in {"while", "do-while"}]
+            if not any(induction["recovered"] and induction["step"] == 1 and
+                       induction["comparison"] in {"ult", "ule"}
+                       for induction in inductions):
+                raise AssertionError(
+                    f"simple source loop lacks an unsigned +1 induction fact: {inductions}")
+
+        if name == "airece_semantic_dense_switch":
+            mappings = [region for region in document["control"]["regions"]
+                        if region["kind"] == "switch"]
+            required_mapping = fixture.name.startswith("airece-semantic-source-fixture")
+            if (required_mapping and not mappings) or (mappings and not any(
+                    region["switch_values_complete"] and
+                    [case["value"] for case in region["switch_cases"]] ==
+                    [0, 1, 2, 3, 4, 5] for region in mappings)):
+                raise AssertionError(
+                    f"dense switch lacks its exact source case values: {mappings}")
+
         pseudo = run(
             airece, "fn", str(fixture), address, "--view", "pseudo",
             "--profile", "fast", "--max-bytes", "65536",
@@ -166,6 +220,51 @@ def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
         if references - definitions:
             raise AssertionError(
                 f"undefined qualified labels: {sorted(references - definitions)}")
+        if "undefined_x86_flag" in pseudo or "multi_bit_shift_of" in pseudo:
+            raise AssertionError("undefined flag bookkeeping leaked into pseudocode")
+
+    # Source-backed directed-flow facts. These intentionally run only where a
+    # real call remains after optimization; optimized tail calls are validated
+    # by the ordinary semantic contract above.
+    interproc = documents["airece_semantic_interproc"]
+    calls = [statement for statement in interproc["statements"]
+             if statement["kind"] == "call"]
+    if calls:
+        call_address = calls[0]["address"]
+        returned = [statement for statement in interproc["statements"]
+                    if statement["kind"] == "return"]
+        call_values = set(calls[0]["values"])
+        if not returned or not any(call_values & set(statement["dependencies"])
+                                   for statement in returned):
+            raise AssertionError(
+                f"caller return does not depend on its callee result: {returned}")
+        flow = json.loads(run(
+            airece, "flow", str(fixture),
+            "--source", f"funcarg(0)@{exports['airece_semantic_interproc']}",
+            "--target", f"callresult@{call_address}",
+            "--mode", "taint", "--function-depth", "3",
+            "--max-paths", "4", "--max-states", "2000", "--json",
+        ))
+        if flow["verdict"] != "may-flow" or not flow["influences"]:
+            raise AssertionError(
+                f"source argument did not flow through the source-backed callee: {flow}")
+
+    memory = documents["airece_semantic_memory_flow"]
+    writes = [statement for statement in memory["statements"]
+              if statement["kind"] == "memory-write" and
+              "&stack_" not in statement["text"]]
+    if not writes:
+        raise AssertionError("source memory-flow fixture has no pointee write")
+    memory_flow = json.loads(run(
+        airece, "flow", str(fixture),
+        "--source", f"funcarg(1)@{exports['airece_semantic_memory_flow']}",
+        "--target", f"memory-write@{writes[-1]['address']}",
+        "--mode", "taint", "--function-depth", "1",
+        "--max-paths", "4", "--max-states", "2000", "--json",
+    ))
+    if memory_flow["verdict"] != "may-flow" or not memory_flow["influences"]:
+        raise AssertionError(
+            f"source argument did not reach the source-backed pointee write: {memory_flow}")
 
 
 def main() -> int:

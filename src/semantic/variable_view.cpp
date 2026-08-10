@@ -802,6 +802,7 @@ struct VariableRecovery::Impl {
         const std::size_t value_count = xair_module_value_count(module);
         std::vector<Candidate> candidates(value_count);
         std::vector<std::size_t> uses(value_count, 0);
+        std::vector<std::size_t> meaningful_uses(value_count, 0);
         std::vector<bool> in_scope(value_count, false);
         std::map<StackKey, StorageRecord> stacks;
         std::map<GlobalKey, StorageRecord> globals;
@@ -832,6 +833,7 @@ struct VariableRecovery::Impl {
                 for (std::size_t index = 0; index < input_count; ++index) {
                     if (inputs[index] < uses.size()) {
                         ++uses[inputs[index]];
+                        if (op.opcode != XAIR_OP_CALL) ++meaningful_uses[inputs[index]];
                         in_scope[inputs[index]] = true;
                         append_unique_op(candidates[inputs[index]].operations, operation);
                     }
@@ -945,6 +947,7 @@ struct VariableRecovery::Impl {
             if (xair_block_terminator(module, block, &terminator) == XAIR_OK) {
                 if (terminator.condition < uses.size()) {
                     ++uses[terminator.condition];
+                    ++meaningful_uses[terminator.condition];
                     in_scope[terminator.condition] = true;
                 }
                 for (std::size_t index = 0; index < terminator.true_arg_count; ++index) {
@@ -964,6 +967,7 @@ struct VariableRecovery::Impl {
                         const xair_value_id value = terminator.true_args[index];
                         const xair_type type = xair_value_type(module, value);
                         if (type.kind == XAIR_TYPE_MEM || type.kind == XAIR_TYPE_FLAGS) continue;
+                        ++meaningful_uses[value];
                         select_candidate(candidates, value, variable_role_return);
                         break;
                     }
@@ -971,7 +975,43 @@ struct VariableRecovery::Impl {
             }
         }
 
+        /* A parameter can cross one or more block arguments before its first
+         * semantic use. Propagate that relevance backward through CFG edges so
+         * Debug/O0 prologues retain their real arity without treating values
+         * used only as speculative CALL operands as parameters. */
+        for (std::size_t pass = 0; pass <= scope.blocks.size(); ++pass) {
+            bool changed = false;
+            for (const xair_block_id block : scope.blocks) {
+                xair_term_view terminator{};
+                if (xair_block_terminator(module, block, &terminator) != XAIR_OK) continue;
+                const auto propagate_relevance = [&](const xair_block_id target,
+                                                     const xair_value_id* arguments,
+                                                     const std::size_t argument_count) {
+                    if (std::find(scope.blocks.begin(), scope.blocks.end(), target) ==
+                            scope.blocks.end() || arguments == nullptr) return;
+                    const std::size_t count = std::min(
+                        xair_block_param_count(module, target), argument_count);
+                    for (std::size_t index = 0; index < count; ++index) {
+                        xair_value_id parameter = XAIR_INVALID_ID;
+                        if (xair_block_param_value(module, target, index, &parameter) != XAIR_OK ||
+                            parameter >= meaningful_uses.size() ||
+                            arguments[index] >= meaningful_uses.size() ||
+                            meaningful_uses[parameter] == 0 ||
+                            meaningful_uses[arguments[index]] != 0) continue;
+                        meaningful_uses[arguments[index]] = 1;
+                        changed = true;
+                    }
+                };
+                propagate_relevance(
+                    terminator.true_target, terminator.true_args, terminator.true_arg_count);
+                propagate_relevance(
+                    terminator.false_target, terminator.false_args, terminator.false_arg_count);
+            }
+            if (!changed) break;
+        }
+
         const std::size_t param_count = xair_block_param_count(module, scope.entry_block);
+        xair_value_id entry_stack_pointer = XAIR_INVALID_ID;
         for (std::size_t index = 0; index < param_count; ++index) {
             xair_value_id value = XAIR_INVALID_ID;
             if (xair_block_param_value(module, scope.entry_block, index, &value) != XAIR_OK ||
@@ -980,10 +1020,56 @@ struct VariableRecovery::Impl {
             }
             const auto argument = abi_argument_index(
                 xair_value_name(module, value), scope.calling_convention);
-            if (!argument) continue;
+            const char* raw_name = xair_value_name(module, value);
+            if (raw_name != nullptr) {
+                const std::string lowered = ascii_lower(raw_name);
+                if (lowered == "rsp" || lowered == "esp") entry_stack_pointer = value;
+            }
+            if (!argument || (*argument != 0 && meaningful_uses[value] == 0)) continue;
             Candidate& candidate = select_candidate(
                 candidates, value, variable_role_argument);
             candidate.argument_index = *argument;
+        }
+
+        /* Entry ABI identities must survive XAIR block parameters. Propagate
+         * them along explicit CFG arguments before presentation variables are
+         * materialized. */
+        for (std::size_t pass = 0; pass <= scope.blocks.size(); ++pass) {
+            bool changed = false;
+            for (const xair_block_id block : scope.blocks) {
+                xair_term_view terminator{};
+                if (xair_block_terminator(module, block, &terminator) != XAIR_OK) {
+                    continue;
+                }
+                const auto propagate = [&](const xair_block_id target,
+                                           const xair_value_id* arguments,
+                                           const std::size_t argument_count) {
+                    if (std::find(scope.blocks.begin(), scope.blocks.end(), target) ==
+                            scope.blocks.end() || arguments == nullptr) return;
+                    const std::size_t count = std::min(
+                        xair_block_param_count(module, target), argument_count);
+                    for (std::size_t index = 0; index < count; ++index) {
+                        const xair_value_id source = arguments[index];
+                        xair_value_id parameter = XAIR_INVALID_ID;
+                        if (source >= candidates.size() ||
+                            (candidates[source].roles & variable_role_argument) == 0 ||
+                            xair_block_param_value(module, target, index, &parameter) != XAIR_OK ||
+                            parameter >= candidates.size()) continue;
+                        Candidate& destination = select_candidate(
+                            candidates, parameter, variable_role_argument);
+                        if (destination.argument_index !=
+                            candidates[source].argument_index) {
+                            destination.argument_index = candidates[source].argument_index;
+                            changed = true;
+                        }
+                    }
+                };
+                propagate(terminator.true_target, terminator.true_args,
+                          terminator.true_arg_count);
+                propagate(terminator.false_target, terminator.false_args,
+                          terminator.false_arg_count);
+            }
+            if (!changed) break;
         }
 
         for (const auto& [value, symbol_indexes] : value_symbols) {
@@ -1044,6 +1130,7 @@ struct VariableRecovery::Impl {
             variable.stable_id = "value:" + std::to_string(effective.value);
             variable.kind = primary_kind(effective.roles);
             variable.roles = effective.roles;
+            variable.argument_index = effective.argument_index;
             variable.primary_value = effective.value;
             variable.values.push_back(effective.value);
             if ((effective.roles & variable_role_global) != 0) {
@@ -1054,6 +1141,24 @@ struct VariableRecovery::Impl {
             variable.evidence = evidence_for_operations(
                 effective.operations, XAIR_CONFIDENCE_HIGH,
                 "XAIR value and role evidence");
+            if ((effective.roles & variable_role_argument) != 0 &&
+                effective.argument_index != std::numeric_limits<std::size_t>::max()) {
+                const auto existing = std::find_if(
+                    view.variables.begin(), view.variables.end(),
+                    [&](const PresentationVariable& item) {
+                        return (item.roles & variable_role_argument) != 0 &&
+                            !item.storage_identity &&
+                            item.argument_index == effective.argument_index;
+                    });
+                if (existing != view.variables.end()) {
+                    existing->values.push_back(effective.value);
+                    existing->roles |= effective.roles;
+                    existing->evidence.operations.insert(
+                        existing->evidence.operations.end(),
+                        effective.operations.begin(), effective.operations.end());
+                    continue;
+                }
+            }
             view.variables.push_back(std::move(variable));
         }
 
@@ -1064,7 +1169,8 @@ struct VariableRecovery::Impl {
             const char* base_name_raw = xair_value_name(module, key.base);
             const std::string base_name = base_name_raw == nullptr
                 ? std::string{} : ascii_lower(base_name_raw);
-            const auto argument = (base_name == "rsp" || base_name == "esp")
+            const auto argument = key.base == entry_stack_pointer &&
+                    (base_name == "rsp" || base_name == "esp")
                 ? stack_argument_index(key.offset, scope.calling_convention)
                 : std::nullopt;
             variable.kind = argument ? VariableKind::argument : VariableKind::stack_slot;
@@ -1075,6 +1181,8 @@ struct VariableRecovery::Impl {
             variable.address_values = record.address_values;
             variable.data_values = record.data_values;
             variable.stack_offset = key.offset;
+            variable.argument_index = argument
+                ? *argument : std::numeric_limits<std::size_t>::max();
             variable.storage_bits = key.bits;
             variable.storage_identity = true;
             variable.overlaps_uncertain = record.overlap;
@@ -1149,10 +1257,37 @@ struct VariableRecovery::Impl {
             view.variables.push_back(std::move(variable));
         }
 
+        /* An unknown ABI has no arity metadata. A gap in the observed register
+         * prefix means later volatile argument registers are compiler
+         * temporaries, not defensible parameters. Keep the contiguous prefix
+         * and let symbols/call-site evidence provide wider signatures later. */
+        std::unordered_set<std::size_t> argument_indices;
+        for (const PresentationVariable& variable : view.variables) {
+            if ((variable.roles & variable_role_argument) != 0 &&
+                !variable.storage_identity &&
+                variable.argument_index != std::numeric_limits<std::size_t>::max()) {
+                argument_indices.insert(variable.argument_index);
+            }
+        }
+        std::size_t contiguous_arguments = 0;
+        while (argument_indices.contains(contiguous_arguments)) ++contiguous_arguments;
+        view.variables.erase(
+            std::remove_if(view.variables.begin(), view.variables.end(),
+                [&](const PresentationVariable& variable) {
+                    return (variable.roles & variable_role_argument) != 0 &&
+                        !variable.storage_identity &&
+                        variable.argument_index >= contiguous_arguments;
+                }),
+            view.variables.end());
+
         std::sort(view.variables.begin(), view.variables.end(),
             [](const PresentationVariable& left, const PresentationVariable& right) {
                 if (left.kind != right.kind) {
                     return static_cast<int>(left.kind) < static_cast<int>(right.kind);
+                }
+                if (left.kind == VariableKind::argument &&
+                    left.argument_index != right.argument_index) {
+                    return left.argument_index < right.argument_index;
                 }
                 if (left.primary_value != right.primary_value) {
                     return left.primary_value < right.primary_value;

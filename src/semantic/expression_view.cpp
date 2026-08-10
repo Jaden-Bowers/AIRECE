@@ -147,6 +147,7 @@ struct ExpressionRecovery::Impl {
 
     struct RenderState {
         const ExpressionOptions& options;
+        const std::unordered_map<xair_value_id, std::string>* value_names{};
         std::size_t nodes{};
         bool truncated{};
         std::size_t omitted{};
@@ -196,7 +197,11 @@ struct ExpressionRecovery::Impl {
         if (value < use_counts.size()) ++use_counts[value];
     }
 
-    std::string leaf(const xair_value_id value) const {
+    std::string leaf(const xair_value_id value, const RenderState& state) const {
+        if (state.value_names != nullptr) {
+            const auto named = state.value_names->find(value);
+            if (named != state.value_names->end()) return named->second;
+        }
         const char* name = xair_value_name(module, value);
         if (name != nullptr && name[0] != '\0') return name;
         return "v" + std::to_string(value);
@@ -337,17 +342,17 @@ struct ExpressionRecovery::Impl {
         xair_op_id operation = XAIR_INVALID_ID;
         if (xair_value_definition(module, value, &operation) != XAIR_OK ||
             operation == XAIR_INVALID_ID) {
-            return {leaf(value), precedence_atom};
+            return {leaf(value, state), precedence_atom};
         }
         xair_op_view_v3 view{};
         if (xair_module_get_op_v3(module, operation, &view) != XAIR_OK) {
             state.truncated = true;
             ++state.omitted;
-            return {leaf(value), precedence_atom};
+            return {leaf(value, state), precedence_atom};
         }
         if (state.active.contains(value) ||
             !can_expand(value, operation, view.opcode, horizon, depth, root, state)) {
-            return {leaf(value), precedence_atom};
+            return {leaf(value, state), precedence_atom};
         }
         ++state.nodes;
         state.active.insert(value);
@@ -467,14 +472,14 @@ struct ExpressionRecovery::Impl {
             definition == XAIR_INVALID_ID ||
             xair_module_get_op_v3(module, definition, &view) != XAIR_OK ||
             xair_op_inputs(module, definition, &inputs, &count) != XAIR_OK) {
-            return {std::string(xair_opcode_name(flag_opcode)) + '(' + leaf(flags) + ')',
+            return {std::string(xair_opcode_name(flag_opcode)) + '(' + leaf(flags, state) + ')',
                     precedence_atom};
         }
         const bool add = view.opcode == XAIR_OP_FLAGS_ADD;
         const bool sub = view.opcode == XAIR_OP_FLAGS_SUB;
         const bool logic = view.opcode == XAIR_OP_FLAGS_LOGIC;
         if ((!add && !sub && !logic) || count == 0) {
-            return {std::string(xair_opcode_name(flag_opcode)) + '(' + leaf(flags) + ')',
+            return {std::string(xair_opcode_name(flag_opcode)) + '(' + leaf(flags, state) + ')',
                     precedence_atom};
         }
         track_operation(state, definition);
@@ -567,7 +572,7 @@ struct ExpressionRecovery::Impl {
         const xair_value_id* inputs = nullptr;
         std::size_t count = 0;
         if (xair_op_inputs(module, operation, &inputs, &count) != XAIR_OK) {
-            return {leaf(value), precedence_atom};
+            return {leaf(value, state), precedence_atom};
         }
         xair_op_attributes attributes{};
         (void)xair_op_attributes_get(module, operation, &attributes);
@@ -757,7 +762,8 @@ struct ExpressionRecovery::Impl {
 
     SemanticExpression build_uncached(
         const xair_value_id value,
-        const ExpressionOptions& options) const {
+        const ExpressionOptions& options,
+        const std::unordered_map<xair_value_id, std::string>* value_names = nullptr) const {
         SemanticExpression result;
         result.value = value;
         if (value >= xair_module_value_count(module)) {
@@ -778,7 +784,7 @@ struct ExpressionRecovery::Impl {
                 result.display = display_kind(view.opcode);
             }
         }
-        RenderState state{options};
+        RenderState state{options, value_names};
         const Rendered rendered = render_value(value, root, 0, true, state);
         result.text = rendered.text;
         if (options.max_characters != 0 && result.text.size() > options.max_characters) {
@@ -818,6 +824,13 @@ struct ExpressionRecovery::Impl {
         return result;
     }
 
+    SemanticExpression build_named(
+        const xair_value_id value,
+        const std::unordered_map<xair_value_id, std::string>& value_names,
+        const ExpressionOptions& options) const {
+        return build_uncached(value, options, &value_names);
+    }
+
     const xair_module* module{};
     std::vector<Location> locations;
     std::vector<std::size_t> use_counts;
@@ -836,6 +849,13 @@ SemanticExpression ExpressionRecovery::build(
     const xair_value_id value,
     const ExpressionOptions& options) const {
     return impl_->build(value, options);
+}
+
+SemanticExpression ExpressionRecovery::build_named(
+    const xair_value_id value,
+    const std::unordered_map<xair_value_id, std::string>& value_names,
+    const ExpressionOptions& options) const {
+    return impl_->build_named(value, value_names, options);
 }
 
 std::size_t ExpressionRecovery::cache_size() const noexcept {

@@ -57,6 +57,15 @@ struct ControlSwitchCase {
     std::uint64_t raw_target{};
 };
 
+struct ControlInduction {
+    bool recovered{};
+    xair_value_id variable{XAIR_INVALID_ID};
+    xair_value_id initial{XAIR_INVALID_ID};
+    xair_value_id bound{XAIR_INVALID_ID};
+    std::int64_t step{};
+    std::string comparison;
+};
+
 struct ControlRegion {
     std::string stable_id;
     ControlRegionKind kind{ControlRegionKind::block};
@@ -69,6 +78,8 @@ struct ControlRegion {
     xair_cfg_node_id switch_default{XAIR_CFG_INVALID_ID};
     std::uint64_t switch_default_raw{};
     bool switch_mapping_complete{};
+    bool switch_values_complete{};
+    ControlInduction induction;
     ControlEvidence evidence;
 };
 

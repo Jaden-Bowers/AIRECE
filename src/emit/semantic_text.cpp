@@ -159,6 +159,14 @@ bool render_pseudo_node(
             statement.kind == SemanticStatementKind::indirect_target) {
             continue;
         }
+        if (statement.kind == SemanticStatementKind::unresolved &&
+            (statement.semantic_id == "undefined_x86_flag" ||
+             statement.semantic_id == "multi_bit_shift_of")) {
+            /* Architectural undefined-flag provenance remains in compact,
+             * JSON evidence, and IR views; it is machine bookkeeping rather
+             * than a source-level pseudocode statement. */
+            continue;
+        }
         writer.line(indent + statement.text + ";  // " + statement.stable_id +
             (statement.evidence_id.empty()
                 ? " @0x" + hex_value(statement.address)
