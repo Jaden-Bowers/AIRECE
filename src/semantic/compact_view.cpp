@@ -339,9 +339,20 @@ struct CompactRecovery::Impl {
 
         std::unordered_map<xair_value_id, std::string> names;
         for (const PresentationVariable& variable : variables.variables) {
-            for (const xair_value_id value : variable.values) names[value] = variable.name.text;
-            if (variable.primary_value != XAIR_INVALID_ID) {
-                names[variable.primary_value] = variable.name.text;
+            if (variable.storage_identity) {
+                for (const xair_value_id address : variable.address_values) {
+                    names[address] = "&" + variable.name.text;
+                }
+                if (variable.primary_value != XAIR_INVALID_ID) {
+                    names[variable.primary_value] = "&" + variable.name.text;
+                }
+            } else {
+                for (const xair_value_id value : variable.values) {
+                    names[value] = variable.name.text;
+                }
+                if (variable.primary_value != XAIR_INVALID_ID) {
+                    names[variable.primary_value] = variable.name.text;
+                }
             }
             if ((variable.roles & variable_role_argument) != 0) {
                 view.parameters.push_back(variable);
@@ -354,6 +365,7 @@ struct CompactRecovery::Impl {
         std::unordered_map<xair_block_id, xair_cfg_node_id> block_nodes;
         std::unordered_map<xair_block_id, std::uint64_t> block_addresses;
         std::unordered_map<xair_block_id, std::uint64_t> all_block_addresses;
+        std::unordered_map<std::string, std::size_t> nonexact_mnemonics;
         for (std::size_t node_index = 0; node_index < xair_cfg_node_count(&cfg);
              ++node_index) {
             const xair_cfg_node* node = xair_cfg_get_node(
@@ -377,6 +389,22 @@ struct CompactRecovery::Impl {
             view.coverage.exact_instructions += exact_instructions;
             view.coverage.nonexact_instructions +=
                 node->instruction_count - exact_instructions;
+            if (exact_instructions < node->instruction_count) {
+                std::uint64_t address = node->start;
+                for (std::size_t instruction_index = 0;
+                     instruction_index < node->instruction_count && address < node->end;
+                     ++instruction_index) {
+                    xair_x86_decoded_inst instruction{};
+                    if (xair_decode_instruction(&binary, address, &instruction) != XAIR_OK ||
+                        instruction.length == 0) break;
+                    if (instruction_index >= exact_instructions) {
+                        ++nonexact_mnemonics[
+                            xair_x86_decoder_mnemonic_name(
+                                instruction.decoder_mnemonic)];
+                    }
+                    address += instruction.length;
+                }
+            }
             if (node->ir_block != XAIR_INVALID_ID) {
                 block_nodes[node->ir_block] = node_id;
                 block_addresses[node->ir_block] = node->start;
@@ -424,6 +452,14 @@ struct CompactRecovery::Impl {
                 static_cast<double>(view.coverage.exact_instructions) * 100.0 /
                 static_cast<double>(view.coverage.total_instructions));
         }
+        view.coverage.nonexact_mnemonics.assign(
+            nonexact_mnemonics.begin(), nonexact_mnemonics.end());
+        std::sort(view.coverage.nonexact_mnemonics.begin(),
+                  view.coverage.nonexact_mnemonics.end(),
+            [](const auto& left, const auto& right) {
+                return left.second != right.second
+                    ? left.second > right.second : left.first < right.first;
+            });
 
         std::vector<SemanticStatement> material;
         std::vector<SemanticEvidence> material_evidence;
@@ -477,6 +513,9 @@ struct CompactRecovery::Impl {
                     operation, node_id, node->ir_block);
                 SemanticStatement statement;
                 statement.operations.push_back(operation);
+                if (attributes.semantic_id != nullptr) {
+                    statement.semantic_id = attributes.semantic_id;
+                }
                 if (raw.opcode == XAIR_OP_CALL) {
                     ++view.total_calls;
                     const std::size_t call_index = seen_calls++;
@@ -592,6 +631,9 @@ struct CompactRecovery::Impl {
                 if (is_unresolved_opcode(raw.opcode)) {
                     statement.kind = SemanticStatementKind::unresolved;
                     statement.text = std::string(xair_opcode_name(raw.opcode)) +
+                        (statement.semantic_id.empty()
+                            ? std::string{}
+                            : "<" + statement.semantic_id + ">") +
                         "(op" + std::to_string(operation) + ')';
                     ++view.coverage.unresolved_operations;
                     append_statement(material, std::move(statement), evidence);
@@ -695,6 +737,12 @@ struct CompactRecovery::Impl {
             statement.text = indirect->candidate_count == 0
                 ? "unresolved indirect target"
                 : "possible indirect targets:";
+            if (indirect->kind == XAIR_INDIRECT_SWITCH &&
+                indirect->index_expr != XAIR_INVALID_ID) {
+                statement.text = "switch " +
+                    value_text(indirect->index_expr, names, options) + " targets:";
+                statement.values.push_back(indirect->index_expr);
+            }
             std::size_t candidate_count = 0;
             const std::uint64_t* candidates = xair_cfg_indirect_candidates(
                 &cfg, index, &candidate_count);
@@ -715,6 +763,43 @@ struct CompactRecovery::Impl {
             append_statement(material, std::move(statement), evidence);
             material_evidence.push_back(std::move(evidence));
         }
+
+        /* Supplemental indirect-resolution records are discovered after the
+         * block walk. Restore CFG/source order and keep terminal transfers as
+         * the final record in each node. */
+        std::unordered_map<xair_cfg_node_id, std::size_t> node_order;
+        for (std::size_t index = 0; index < view.control.block_order.size(); ++index) {
+            node_order.emplace(view.control.block_order[index], index);
+        }
+        std::vector<std::size_t> statement_order(material.size());
+        for (std::size_t index = 0; index < statement_order.size(); ++index) {
+            statement_order[index] = index;
+        }
+        const auto terminal_statement = [](const SemanticStatementKind kind) {
+            return kind == SemanticStatementKind::return_value ||
+                kind == SemanticStatementKind::trap ||
+                kind == SemanticStatementKind::fault;
+        };
+        std::stable_sort(statement_order.begin(), statement_order.end(),
+            [&](const std::size_t left, const std::size_t right) {
+                const std::size_t left_node = node_order.contains(material[left].node)
+                    ? node_order.at(material[left].node) : node_order.size();
+                const std::size_t right_node = node_order.contains(material[right].node)
+                    ? node_order.at(material[right].node) : node_order.size();
+                if (left_node != right_node) return left_node < right_node;
+                return terminal_statement(material[left].kind) <
+                    terminal_statement(material[right].kind);
+            });
+        std::vector<SemanticStatement> ordered_material;
+        std::vector<SemanticEvidence> ordered_evidence;
+        ordered_material.reserve(material.size());
+        ordered_evidence.reserve(material_evidence.size());
+        for (const std::size_t index : statement_order) {
+            ordered_material.push_back(std::move(material[index]));
+            ordered_evidence.push_back(std::move(material_evidence[index]));
+        }
+        material = std::move(ordered_material);
+        material_evidence = std::move(ordered_evidence);
 
         const std::size_t keep = options.max_statements == 0
             ? material.size() : std::min(material.size(), options.max_statements);

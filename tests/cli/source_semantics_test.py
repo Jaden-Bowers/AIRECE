@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import json
+import argparse
 import pathlib
 import re
 import struct
 import subprocess
 import sys
+import tempfile
 
 
 def run(airece: pathlib.Path, *arguments: str) -> str:
@@ -72,15 +74,36 @@ def pe_exports(path: pathlib.Path) -> dict[str, str]:
     return result
 
 
-def main() -> int:
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: source_semantics_test.py <airece> <fixture>")
-    airece = pathlib.Path(sys.argv[1])
-    fixture = pathlib.Path(sys.argv[2])
+def clang_fixtures(source: pathlib.Path, clang_cl: pathlib.Path,
+                   lld_link: pathlib.Path, directory: pathlib.Path) -> list[pathlib.Path]:
+    fixtures: list[pathlib.Path] = []
+    for label, optimize in (("o0", "/Od"), ("o2", "/O2")):
+        object_path = directory / f"semantic-clang-{label}.obj"
+        fixture = directory / f"semantic-clang-{label}.dll"
+        compile_result = subprocess.run(
+            [str(clang_cl), "/nologo", "/c", optimize, "/Ob0" if label == "o0" else "/Ob2",
+             "/GS-", f"/Fo{object_path}", str(source)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if compile_result.returncode != 0:
+            raise AssertionError(f"clang-cl fixture compile failed: {compile_result.stderr}")
+        link_result = subprocess.run(
+            [str(lld_link), "/dll", "/entry:airece_semantic_entry", "/nodefaultlib",
+             f"/out:{fixture}", str(object_path)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if link_result.returncode != 0:
+            raise AssertionError(f"lld-link fixture link failed: {link_result.stderr}")
+        fixtures.append(fixture)
+    return fixtures
+
+
+def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
     exports = pe_exports(fixture)
     expected = {
         "airece_semantic_load", "airece_semantic_branch",
-        "airece_semantic_switch",
+        "airece_semantic_switch", "airece_semantic_dense_switch",
+        "airece_semantic_loop", "airece_semantic_storage",
     }
     missing = expected - exports.keys()
     if missing:
@@ -107,6 +130,10 @@ def main() -> int:
                 destination = statement["text"].split("=", 1)[0].strip()
                 if "(" in destination or destination.startswith("load"):
                     raise AssertionError(f"expression used as load destination: {statement}")
+            if statement["kind"] == "memory-write":
+                match = re.match(r"store\d+\(([^,]+),\s*(.+)\)$", statement["text"])
+                if match and match.group(1).strip() == match.group(2).strip():
+                    raise AssertionError(f"storage address reused as stored data: {statement}")
 
         terminal = {"return", "trap", "fault"}
         for node, node_statements in by_node.items():
@@ -117,6 +144,13 @@ def main() -> int:
                         f"statement follows terminal transfer in node {node}: {statement}")
                 terminal_seen = statement["kind"] in terminal or bool(
                     statement.get("no_return"))
+        if name == "airece_semantic_storage":
+            memory_text = "\n".join(
+                statement["text"] for statement in statements
+                if statement["kind"] in {"memory-read", "memory-write"})
+            if "&stack_" not in memory_text:
+                raise AssertionError(
+                    f"storage fixture lacks an address-qualified stack identity: {memory_text}")
 
         pseudo = run(
             airece, "fn", str(fixture), address, "--view", "pseudo",
@@ -125,11 +159,31 @@ def main() -> int:
         )
         if re.search(r"(?m)^\s*case\s+0x", pseudo):
             raise AssertionError("switch destination address emitted as a case value")
+        if re.search(r"\b[^;()]+\s+-\s+[^;()]+\s+==\s+0\b", pseudo):
+            raise AssertionError("subtraction-zero flag leaked instead of a comparison")
         definitions = set(re.findall(r"(?m)^(F[0-9a-fA-F]+_L\d+):", pseudo))
         references = set(re.findall(r"\b(F[0-9a-fA-F]+_L\d+)\b", pseudo))
         if references - definitions:
             raise AssertionError(
                 f"undefined qualified labels: {sorted(references - definitions)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("airece", type=pathlib.Path)
+    parser.add_argument("fixtures", nargs="+", type=pathlib.Path)
+    parser.add_argument("--source", type=pathlib.Path)
+    parser.add_argument("--clang-cl", type=pathlib.Path)
+    parser.add_argument("--lld-link", type=pathlib.Path)
+    arguments = parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix="airece-semantic-") as temporary:
+        fixtures = list(arguments.fixtures)
+        if arguments.source and arguments.clang_cl and arguments.lld_link:
+            fixtures.extend(clang_fixtures(
+                arguments.source, arguments.clang_cl, arguments.lld_link,
+                pathlib.Path(temporary)))
+        for fixture in fixtures:
+            verify_fixture(arguments.airece, fixture)
     return 0
 
 

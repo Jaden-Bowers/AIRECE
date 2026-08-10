@@ -3,11 +3,15 @@
 `tools/evaluate.py` exercises the shipped CLI as an agent would: it verifies
 bounded opening, lazy solver behavior, valid/bounded semantic JSON, stable IDs
 under smaller budgets, ABI-only returns, proper result destinations, terminal
-ordering, conservative switch rendering, and pseudocode label integrity. For
+ordering, storage-address/data separation, canonical comparisons, conservative
+switch rendering, and pseudocode label integrity. For
 each binary it analyzes the entry plus a deterministic sample spread across
 the discovered function address space. It reports both block coverage and
 frequency-weighted exact/non-exact instruction coverage rather than treating the
-decoder's mnemonic table or only the entry function as a workload proxy.
+decoder's mnemonic table or only the entry function as a workload proxy. Each
+report also ranks decoder mnemonic names in non-exact instruction slots and
+unresolved XAIR semantic IDs, giving implementation work a corpus-frequency
+priority instead of a raw mnemonic-count priority.
 
 The Assemblage archive is consumed with Python's streaming, compression-
 autodetecting `r|*` tar mode (the current `.xz`-named release is Zstandard data).
@@ -28,6 +32,8 @@ Use the compiler manifest for fast regression runs and a progressively larger
 Assemblage sample for controlled dogfooding. A passing run is not a malware
 readiness claim: it is a reproducible semantic-quality measurement with
 per-function and per-binary failures retained in the report. The CTest suite
-also builds a CRT-free MSVC fixture from
-`tests/fixtures/semantic_contract.c` and checks expected load, return, branch,
-and switch presentation contracts against real compiler output.
+builds CRT-free MSVC `/Od` and `/O2` fixtures from
+`tests/fixtures/semantic_contract.c`. When `clang-cl` and `lld-link` are
+available it builds equivalent Clang O0/O2 fixtures in a temporary directory.
+Both Debug and Release configurations check load/store identity, return,
+branch, loop, ordering, and switch contracts against real compiler output.

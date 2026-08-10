@@ -210,6 +210,30 @@ struct ControlRecovery::Impl {
                 view.entry = function_nodes[index];
             }
         }
+        /* CFG function ownership can conservatively split jump-table arms into
+         * root-like fragments. A resolved indirect jump is still an
+         * intra-procedural transfer, so include its cases/default in this
+         * semantic function without following call edges. */
+        const std::size_t resolved_indirects = xair_cfg_indirect_count(&cfg);
+        for (std::size_t index = 0; index < resolved_indirects; ++index) {
+            const xair_indirect_resolution* indirect = xair_cfg_get_indirect(&cfg, index);
+            if (indirect == nullptr || indirect->kind != XAIR_INDIRECT_SWITCH) continue;
+            const xair_cfg_edge* source_edge = xair_cfg_get_edge(&cfg, indirect->edge);
+            if (source_edge == nullptr || !node_set.contains(source_edge->src)) continue;
+            std::size_t candidate_count = 0;
+            const std::uint64_t* candidates = xair_cfg_indirect_candidates(
+                &cfg, index, &candidate_count);
+            for (std::size_t candidate = 0; candidate < candidate_count; ++candidate) {
+                const xair_cfg_node_id target = xair_cfg_find_node_start(
+                    &cfg, candidates[candidate]);
+                if (target != XAIR_CFG_INVALID_ID) node_set.insert(target);
+            }
+            if ((indirect->flags & XAIR_INDIRECT_RESOLUTION_HAS_DEFAULT) != 0) {
+                const xair_cfg_node_id target = xair_cfg_find_node_start(
+                    &cfg, indirect->default_target);
+                if (target != XAIR_CFG_INVALID_ID) node_set.insert(target);
+            }
+        }
 
         xair_analysis_options analysis_options{};
         xair_analysis_options_init(&analysis_options);
@@ -229,8 +253,7 @@ struct ControlRecovery::Impl {
                 if (node_set.contains(rpo[index])) view.block_order.push_back(rpo[index]);
             }
         }
-        std::vector<xair_cfg_node_id> remaining(function_nodes,
-                                                function_nodes + function_node_count);
+        std::vector<xair_cfg_node_id> remaining(node_set.begin(), node_set.end());
         std::sort(remaining.begin(), remaining.end(),
             [&](const xair_cfg_node_id left, const xair_cfg_node_id right) {
                 const xair_cfg_node* left_node = xair_cfg_get_node(&cfg, left);
@@ -268,7 +291,7 @@ struct ControlRecovery::Impl {
             }
         }
 
-        std::unordered_set<xair_cfg_node_id> switch_sources;
+        std::unordered_map<xair_cfg_node_id, std::size_t> switch_sources;
         const std::size_t indirect_count = xair_cfg_indirect_count(&cfg);
         for (std::size_t index = 0; index < indirect_count; ++index) {
             const xair_indirect_resolution* indirect = xair_cfg_get_indirect(&cfg, index);
@@ -277,7 +300,7 @@ struct ControlRecovery::Impl {
             if (edge != nullptr && node_set.contains(edge->src) &&
                 (indirect->kind == XAIR_INDIRECT_SWITCH ||
                  indirect->candidate_count >= 3)) {
-                switch_sources.insert(edge->src);
+                switch_sources.emplace(edge->src, index);
             }
         }
 
@@ -314,6 +337,7 @@ struct ControlRecovery::Impl {
             std::sort(members.begin(), members.end());
             ControlRegion region;
             region.header = loop.header;
+            region.condition_node = loop.header;
             region.nodes = members;
             region.evidence = region_evidence(members);
             const auto header_edges = outgoing.find(loop.header);
@@ -325,6 +349,7 @@ struct ControlRecovery::Impl {
                         !loop.members.contains(edge.edge.dst)) {
                         header_exit = true;
                         region.condition = edge.edge.condition;
+                        region.join = edge.edge.dst;
                     }
                 }
             }
@@ -336,6 +361,13 @@ struct ControlRecovery::Impl {
                     if (is_conditional_edge(edge.edge.kind)) {
                         latch_condition = true;
                         region.condition = edge.edge.condition;
+                        region.condition_node = source;
+                        for (const EdgeRecord& latch_edge : latch_edges->second) {
+                            if (latch_edge.edge.dst != loop.header &&
+                                !loop.members.contains(latch_edge.edge.dst)) {
+                                region.join = latch_edge.edge.dst;
+                            }
+                        }
                     }
                 }
             }
@@ -358,9 +390,57 @@ struct ControlRecovery::Impl {
                 ControlRegion region;
                 region.kind = ControlRegionKind::switch_region;
                 region.header = node;
+                region.condition_node = node;
                 region.nodes.push_back(node);
                 for (const EdgeRecord& edge : found->second) {
                     region.evidence.edges.push_back(edge.id);
+                }
+                const auto switch_entry = switch_sources.find(node);
+                if (switch_entry != switch_sources.end()) {
+                    const xair_indirect_resolution* indirect =
+                        xair_cfg_get_indirect(&cfg, switch_entry->second);
+                    if (indirect != nullptr) {
+                        region.condition = indirect->index_expr;
+                        if (analysis != nullptr) {
+                            region.join = xair_cfg_analysis_immediate_postdominator(
+                                analysis, node);
+                        }
+                        std::size_t candidate_count = 0;
+                        const std::uint64_t* candidates =
+                            xair_cfg_indirect_candidates(
+                                &cfg, switch_entry->second, &candidate_count);
+                        const bool bounded = indirect->upper_bound >= indirect->lower_bound;
+                        const std::uint64_t span = bounded
+                            ? static_cast<std::uint64_t>(indirect->upper_bound) -
+                                  static_cast<std::uint64_t>(indirect->lower_bound) + 1U
+                            : 0;
+                        const std::uint32_t unsafe_flags =
+                            XAIR_INDIRECT_RESOLUTION_TRUNCATED |
+                            XAIR_INDIRECT_RESOLUTION_BUDGET_LIMITED |
+                            XAIR_INDIRECT_RESOLUTION_INVALID_READ;
+                        bool complete = indirect->kind == XAIR_INDIRECT_SWITCH &&
+                            candidates != nullptr && candidate_count != 0 && bounded &&
+                            span == candidate_count &&
+                            (indirect->flags & unsafe_flags) == 0;
+                        for (std::size_t candidate = 0;
+                             candidate < candidate_count; ++candidate) {
+                            ControlSwitchCase item;
+                            item.value = indirect->lower_bound +
+                                static_cast<std::int64_t>(candidate);
+                            item.raw_target = candidates[candidate];
+                            item.target = xair_cfg_find_node_start(&cfg, item.raw_target);
+                            if (!node_set.contains(item.target)) complete = false;
+                            region.switch_cases.push_back(item);
+                        }
+                        if ((indirect->flags &
+                             XAIR_INDIRECT_RESOLUTION_HAS_DEFAULT) != 0) {
+                            region.switch_default_raw = indirect->default_target;
+                            region.switch_default = xair_cfg_find_node_start(
+                                &cfg, indirect->default_target);
+                            if (!node_set.contains(region.switch_default)) complete = false;
+                        }
+                        region.switch_mapping_complete = complete;
+                    }
                 }
                 region.evidence = region_evidence(region.nodes, region.evidence.edges);
                 add_region(view, std::move(region), options);
@@ -375,6 +455,7 @@ struct ControlRecovery::Impl {
             }
             ControlRegion region;
             region.header = node;
+            region.condition_node = node;
             region.condition = conditional.front().edge.condition;
             region.nodes.push_back(node);
             const bool first_terminal = terminal_node(conditional[0].edge.dst);
@@ -458,6 +539,9 @@ struct ControlRecovery::Impl {
             transfer.target = record.edge.dst;
             transfer.condition = record.edge.condition;
             transfer.raw_target = record.edge.raw_target;
+            transfer.conditional = is_conditional_edge(record.edge.kind);
+            transfer.condition_when_true =
+                record.edge.kind == XAIR_EDGE_CBRANCH_TRUE;
             transfer.evidence = node_evidence(record.edge.src);
             transfer.evidence.edges.push_back(record.id);
             transfer.evidence.confidence = conservative_confidence(

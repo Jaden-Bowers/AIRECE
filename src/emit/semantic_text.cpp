@@ -126,14 +126,23 @@ std::string omitted_footer(
 std::string region_condition(
     const CompactFunctionView& view,
     const ControlRegion& region) {
+    const xair_cfg_node_id condition_node =
+        region.condition_node == XAIR_CFG_INVALID_ID
+        ? region.header : region.condition_node;
     for (const SemanticStatement& statement : view.statements) {
-        if (statement.node != region.header ||
-            statement.kind != SemanticStatementKind::branch ||
-            !statement.text.starts_with("if ")) {
+        if (statement.node != condition_node) {
             continue;
         }
-        const std::size_t end = statement.text.find(" -> ", 3);
-        if (end != std::string::npos) return statement.text.substr(3, end - 3);
+        if (statement.kind == SemanticStatementKind::branch &&
+            statement.text.starts_with("if ")) {
+            const std::size_t end = statement.text.find(" -> ", 3);
+            if (end != std::string::npos) return statement.text.substr(3, end - 3);
+        }
+        if (statement.kind == SemanticStatementKind::indirect_target &&
+            statement.text.starts_with("switch ")) {
+            const std::size_t end = statement.text.find(" targets:", 7);
+            if (end != std::string::npos) return statement.text.substr(7, end - 7);
+        }
     }
     return region.condition == XAIR_INVALID_ID
         ? "unknown_condition" : "v" + std::to_string(region.condition);
@@ -146,7 +155,8 @@ bool render_pseudo_node(
     const std::string& indent) {
     bool emitted = false;
     for (const SemanticStatement& statement : view.statements) {
-        if (statement.node != node || statement.kind == SemanticStatementKind::branch) {
+        if (statement.node != node || statement.kind == SemanticStatementKind::branch ||
+            statement.kind == SemanticStatementKind::indirect_target) {
             continue;
         }
         writer.line(indent + statement.text + ";  // " + statement.stable_id +
@@ -192,6 +202,19 @@ const ControlTransfer* transfer_of_kind(
         view.control.transfers.begin(), view.control.transfers.end(),
         [&](const ControlTransfer& transfer) {
             return transfer.source == source && transfer.kind == kind;
+        });
+    return found == view.control.transfers.end() ? nullptr : &*found;
+}
+
+const ControlTransfer* conditional_transfer(
+    const CompactFunctionView& view,
+    const xair_cfg_node_id source,
+    const bool when_true) {
+    const auto found = std::find_if(
+        view.control.transfers.begin(), view.control.transfers.end(),
+        [&](const ControlTransfer& transfer) {
+            return transfer.source == source && transfer.conditional &&
+                transfer.condition_when_true == when_true;
         });
     return found == view.control.transfers.end() ? nullptr : &*found;
 }
@@ -257,16 +280,147 @@ bool certified_if_region(
         direct_arm_to_join(view, false_transfer->target, region.join);
 }
 
+std::vector<const ControlTransfer*> node_transfers(
+    const CompactFunctionView& view,
+    const xair_cfg_node_id source) {
+    std::vector<const ControlTransfer*> result;
+    for (const ControlTransfer& transfer : view.control.transfers) {
+        if (transfer.source == source &&
+            transfer.kind != ControlTransferKind::call_target &&
+            transfer.kind != ControlTransferKind::return_from_function) {
+            result.push_back(&transfer);
+        }
+    }
+    return result;
+}
+
+bool node_has_nonstructural_statement(
+    const CompactFunctionView& view,
+    const xair_cfg_node_id node) {
+    return std::any_of(view.statements.begin(), view.statements.end(),
+        [node](const SemanticStatement& statement) {
+            return statement.node == node &&
+                statement.kind != SemanticStatementKind::branch &&
+                statement.kind != SemanticStatementKind::constant &&
+                statement.kind != SemanticStatementKind::indirect_target;
+        });
+}
+
+bool certified_simple_loop(
+    const CompactFunctionView& view,
+    const ControlRegion& region,
+    xair_cfg_node_id& body,
+    xair_cfg_node_id& latch) {
+    if ((region.kind != ControlRegionKind::while_loop &&
+         region.kind != ControlRegionKind::do_while_loop) ||
+        region.nodes.size() != 2 || region.join == XAIR_CFG_INVALID_ID ||
+        region.condition == XAIR_INVALID_ID) {
+        return false;
+    }
+    const std::unordered_set<xair_cfg_node_id> members(
+        region.nodes.begin(), region.nodes.end());
+    if (region.kind == ControlRegionKind::while_loop) {
+        if (node_has_nonstructural_statement(view, region.header)) return false;
+        const auto header_transfers = node_transfers(view, region.header);
+        if (header_transfers.size() != 2) return false;
+        const ControlTransfer* inside = nullptr;
+        const ControlTransfer* outside = nullptr;
+        for (const ControlTransfer* transfer : header_transfers) {
+            if (members.contains(transfer->target) &&
+                transfer->target != region.header) inside = transfer;
+            else if (transfer->target == region.join) outside = transfer;
+        }
+        if (inside == nullptr || outside == nullptr ||
+            !uniquely_entered_from(view, inside->target, region.header) ||
+            node_is_terminal(view, inside->target)) return false;
+        const auto body_transfers = node_transfers(view, inside->target);
+        if (body_transfers.size() != 1 ||
+            body_transfers.front()->target != region.header) return false;
+        body = inside->target;
+        latch = region.header;
+        return true;
+    }
+
+    latch = region.condition_node;
+    if (latch == XAIR_CFG_INVALID_ID || latch == region.header ||
+        !members.contains(latch) || node_is_terminal(view, region.header) ||
+        node_is_terminal(view, latch) ||
+        node_has_nonstructural_statement(view, latch)) return false;
+    const auto entry_transfers = node_transfers(view, region.header);
+    if (entry_transfers.size() != 1 || entry_transfers.front()->target != latch) {
+        return false;
+    }
+    const auto latch_transfers = node_transfers(view, latch);
+    if (latch_transfers.size() != 2) return false;
+    bool back = false;
+    bool exit = false;
+    for (const ControlTransfer* transfer : latch_transfers) {
+        back = back || transfer->target == region.header;
+        exit = exit || transfer->target == region.join;
+    }
+    body = region.header;
+    return back && exit;
+}
+
+bool certified_switch_region(
+    const CompactFunctionView& view,
+    const ControlRegion& region) {
+    if (region.kind != ControlRegionKind::switch_region ||
+        !region.switch_mapping_complete || region.switch_cases.empty() ||
+        region.switch_default == XAIR_CFG_INVALID_ID) return false;
+    std::unordered_set<xair_cfg_node_id> targets;
+    const auto safe_target = [&](const xair_cfg_node_id target) {
+        return target != region.header && targets.insert(target).second &&
+            (node_is_terminal(view, target) ||
+             (region.join != XAIR_CFG_INVALID_ID &&
+              direct_arm_to_join(view, target, region.join)));
+    };
+    for (const ControlSwitchCase& item : region.switch_cases) {
+        if (!safe_target(item.target)) return false;
+    }
+    return safe_target(region.switch_default);
+}
+
+const ControlRegion* switch_region_for(
+    const CompactFunctionView& view,
+    const xair_cfg_node_id header) {
+    const auto found = std::find_if(
+        view.control.regions.begin(), view.control.regions.end(),
+        [header](const ControlRegion& region) {
+            return region.kind == ControlRegionKind::switch_region &&
+                region.header == header && region.switch_mapping_complete &&
+                region.switch_default != XAIR_CFG_INVALID_ID;
+        });
+    return found == view.control.regions.end() ? nullptr : &*found;
+}
+
 bool render_fallback_transfers(
     BudgetWriter& writer,
     const CompactFunctionView& view,
     const xair_cfg_node_id node,
     const std::unordered_set<xair_cfg_node_id>& local_nodes) {
     if (node_is_terminal(view, node)) return false;
+    if (const ControlRegion* region = switch_region_for(view, node)) {
+        const std::string index = region_condition(view, *region);
+        for (const ControlSwitchCase& item : region->switch_cases) {
+            writer.line("    if (" + index + " == " +
+                std::to_string(item.value) + ") goto " +
+                qualified_label(view, item.target) + ";");
+        }
+        writer.line("    goto " + qualified_label(view, region->switch_default) +
+            "; /* exact default */");
+        return true;
+    }
     const ControlTransfer* true_transfer = transfer_of_kind(
         view, node, ControlTransferKind::branch_true);
     const ControlTransfer* false_transfer = transfer_of_kind(
         view, node, ControlTransferKind::branch_false);
+    if (true_transfer == nullptr) {
+        true_transfer = conditional_transfer(view, node, true);
+    }
+    if (false_transfer == nullptr) {
+        false_transfer = conditional_transfer(view, node, false);
+    }
     if (true_transfer != nullptr && false_transfer != nullptr &&
         local_nodes.contains(true_transfer->target) &&
         local_nodes.contains(false_transfer->target)) {
@@ -424,16 +578,68 @@ RenderedSemanticText render_pseudo(
         view.control.block_order.begin(), view.control.block_order.end());
     std::unordered_set<xair_cfg_node_id> consumed;
     std::unordered_map<xair_cfg_node_id, const ControlRegion*> structured;
+    std::unordered_map<xair_cfg_node_id, const ControlRegion*> structured_loops;
+    std::unordered_map<xair_cfg_node_id, const ControlRegion*> structured_switches;
     for (const ControlRegion& region : view.control.regions) {
         const ControlTransfer* true_transfer = nullptr;
         const ControlTransfer* false_transfer = nullptr;
         if (certified_if_region(view, region, true_transfer, false_transfer)) {
             structured.emplace(region.header, &region);
         }
+        xair_cfg_node_id body = XAIR_CFG_INVALID_ID;
+        xair_cfg_node_id latch = XAIR_CFG_INVALID_ID;
+        if (certified_simple_loop(view, region, body, latch)) {
+            structured_loops.emplace(region.header, &region);
+        }
+        if (certified_switch_region(view, region)) {
+            structured_switches.emplace(region.header, &region);
+        }
     }
     for (const xair_cfg_node_id node : view.control.block_order) {
         if (consumed.contains(node)) continue;
         writer.line(qualified_label(view, node) + ":");
+        const auto loop_entry = structured_loops.find(node);
+        if (loop_entry != structured_loops.end()) {
+            const ControlRegion& region = *loop_entry->second;
+            xair_cfg_node_id body = XAIR_CFG_INVALID_ID;
+            xair_cfg_node_id latch = XAIR_CFG_INVALID_ID;
+            (void)certified_simple_loop(view, region, body, latch);
+            const std::string condition = region_condition(view, region);
+            if (region.kind == ControlRegionKind::while_loop) {
+                writer.line("    while (" + condition + ") {");
+                (void)render_pseudo_node(writer, view, body, "        ");
+                writer.line("    }");
+            } else {
+                writer.line("    do {");
+                (void)render_pseudo_node(writer, view, body, "        ");
+                writer.line("    } while (" + condition + ");");
+            }
+            consumed.insert(region.header);
+            consumed.insert(body);
+            consumed.insert(latch);
+            continue;
+        }
+        const auto switch_entry = structured_switches.find(node);
+        if (switch_entry != structured_switches.end()) {
+            const ControlRegion& region = *switch_entry->second;
+            (void)render_pseudo_node(writer, view, node, "    ");
+            writer.line("    switch (" + region_condition(view, region) + ") {");
+            for (const ControlSwitchCase& item : region.switch_cases) {
+                writer.line("    case " + std::to_string(item.value) + ":");
+                (void)render_pseudo_node(writer, view, item.target, "        ");
+                if (!node_is_terminal(view, item.target)) writer.line("        break;");
+                consumed.insert(item.target);
+            }
+            writer.line("    default:");
+            (void)render_pseudo_node(writer, view, region.switch_default, "        ");
+            if (!node_is_terminal(view, region.switch_default)) {
+                writer.line("        break;");
+            }
+            writer.line("    }");
+            consumed.insert(node);
+            consumed.insert(region.switch_default);
+            continue;
+        }
         const auto region_entry = structured.find(node);
         if (region_entry != structured.end()) {
             const ControlRegion& region = *region_entry->second;

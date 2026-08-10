@@ -221,25 +221,32 @@ add_custom_command(
 add_custom_target(airece_notices ALL DEPENDS "${AIRECE_NOTICE_OUTPUT}")
 
 if(BUILD_TESTING)
-    add_library(airece_semantic_source_fixture SHARED
-        tests/fixtures/semantic_contract.c)
-    set_target_properties(airece_semantic_source_fixture PROPERTIES
-        OUTPUT_NAME "airece-semantic-source-fixture")
-    if(MSVC)
-        target_compile_options(airece_semantic_source_fixture PRIVATE
-            /Od /Ob0 /GS-)
-        if(POLICY CMP0184)
-            set_property(TARGET airece_semantic_source_fixture PROPERTY
-                MSVC_RUNTIME_CHECKS "")
+    function(airece_add_semantic_fixture target output_name optimized)
+        add_library(${target} SHARED tests/fixtures/semantic_contract.c)
+        set_target_properties(${target} PROPERTIES OUTPUT_NAME ${output_name})
+        if(MSVC)
+            if(optimized)
+                target_compile_options(${target} PRIVATE /O2 /Ob2 /GS-)
+            else()
+                target_compile_options(${target} PRIVATE /Od /Ob0 /GS-)
+            endif()
+            if(POLICY CMP0184)
+                set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_CHECKS "")
+            elseif(NOT optimized)
+                target_compile_definitions(${target} PRIVATE AIRECE_RTC_STUBS=1)
+            endif()
+            target_link_options(${target} PRIVATE
+                /ENTRY:airece_semantic_entry /NODEFAULTLIB)
+        elseif(optimized)
+            target_compile_options(${target} PRIVATE -O2)
         else()
-            target_compile_definitions(airece_semantic_source_fixture PRIVATE
-                AIRECE_RTC_STUBS=1)
+            target_compile_options(${target} PRIVATE -O0)
         endif()
-        target_link_options(airece_semantic_source_fixture PRIVATE
-            /ENTRY:airece_semantic_entry /NODEFAULTLIB)
-    else()
-        target_compile_options(airece_semantic_source_fixture PRIVATE -O0)
-    endif()
+    endfunction()
+    airece_add_semantic_fixture(
+        airece_semantic_source_fixture airece-semantic-source-fixture FALSE)
+    airece_add_semantic_fixture(
+        airece_semantic_source_fixture_opt airece-semantic-source-fixture-opt TRUE)
 
     add_executable(airece_decoder_boundary_tests
         tests/semantic/decoder_boundary_test.cpp)
@@ -345,11 +352,22 @@ if(BUILD_TESTING)
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/flow_command_test.cmake")
 
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    find_program(AIRECE_CLANG_CL_EXECUTABLE clang-cl)
+    find_program(AIRECE_LLD_LINK_EXECUTABLE lld-link)
+    set(AIRECE_CLANG_FIXTURE_ARGUMENTS)
+    if(AIRECE_CLANG_CL_EXECUTABLE AND AIRECE_LLD_LINK_EXECUTABLE)
+        list(APPEND AIRECE_CLANG_FIXTURE_ARGUMENTS
+            --source "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/semantic_contract.c"
+            --clang-cl "${AIRECE_CLANG_CL_EXECUTABLE}"
+            --lld-link "${AIRECE_LLD_LINK_EXECUTABLE}")
+    endif()
     add_test(NAME airece_source_semantics
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/source_semantics_test.py"
             $<TARGET_FILE:airece>
-            $<TARGET_FILE:airece_semantic_source_fixture>)
+            $<TARGET_FILE:airece_semantic_source_fixture>
+            $<TARGET_FILE:airece_semantic_source_fixture_opt>
+            ${AIRECE_CLANG_FIXTURE_ARGUMENTS})
 
     add_test(NAME airece_evaluation_smoke
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/evaluate.py"

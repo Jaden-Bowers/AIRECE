@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 extern "C" {
@@ -48,6 +49,7 @@ struct SemanticStatement {
     std::string stable_id;
     SemanticStatementKind kind{SemanticStatementKind::unresolved};
     std::string text;
+    std::string semantic_id;
     std::uint64_t address{};
     xair_cfg_node_id node{XAIR_CFG_INVALID_ID};
     xair_block_id block{XAIR_INVALID_ID};
@@ -74,6 +76,7 @@ struct SemanticCoverage {
     std::size_t nonexact_instructions{};
     std::size_t total_instructions{};
     std::size_t unresolved_operations{};
+    std::vector<std::pair<std::string, std::size_t>> nonexact_mnemonics;
     std::uint32_t exact_percent{};
     std::uint32_t exact_instruction_percent{};
 };

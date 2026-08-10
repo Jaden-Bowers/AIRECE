@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from collections import Counter
 from typing import Any, Iterable
 
 
@@ -147,6 +148,13 @@ def evaluate_function(
         "(" not in item.get("text", "").split("=", 1)[0]
         for item in reads
     )
+    writes = [item for item in statements if item.get("kind") == "memory-write"]
+    record["checks"]["storage_identities"] = all(
+        not (match := re.match(r"store\d+\(([^,]+),\s*(.+)\)$",
+                               item.get("text", "")))
+        or match.group(1).strip() != match.group(2).strip()
+        for item in writes
+    )
     terminal_seen: set[int] = set()
     source_order_safe = True
     for item in statements:
@@ -159,6 +167,12 @@ def evaluate_function(
     record["checks"]["no_statements_after_terminal"] = source_order_safe
     record["checks"]["switch_values_safe"] = not re.search(
         r"(?m)^\s*case\s+0x", pseudo["stdout"])
+    record["checks"]["canonical_comparisons"] = not re.search(
+        r"\b[^;()]+\s+-\s+[^;()]+\s+==\s+0\b", pseudo["stdout"])
+    record["unresolved_semantic_ids"] = dict(Counter(
+        item.get("semantic_id") for item in statements
+        if item.get("kind") == "unresolved" and item.get("semantic_id")
+    ))
     record["coverage"] = full_json.get("coverage", {})
     record["statements"] = len(statements)
     record["regions"] = len(full_json.get("control", {}).get("regions", []))
@@ -226,6 +240,15 @@ def evaluate_binary(
                     "total_instructions")
     }
     record["coverage"] = coverage
+    nonexact_mnemonics: Counter[str] = Counter()
+    for item in record["function_results"]:
+        nonexact_mnemonics.update(
+            item.get("coverage", {}).get("nonexact_mnemonics", {}))
+    record["nonexact_mnemonics"] = dict(nonexact_mnemonics.most_common())
+    unresolved: Counter[str] = Counter()
+    for item in record["function_results"]:
+        unresolved.update(item.get("unresolved_semantic_ids", {}))
+    record["unresolved_semantic_ids"] = dict(unresolved.most_common())
     record["passed"] = all(record["checks"].values())
     return record
 
@@ -310,6 +333,11 @@ def main() -> int:
         item.get("coverage", {}).get("nonexact_instructions", 0) for item in results)
     total_instructions = sum(
         item.get("coverage", {}).get("total_instructions", 0) for item in results)
+    unresolved_semantic_ids: Counter[str] = Counter()
+    nonexact_mnemonics: Counter[str] = Counter()
+    for item in results:
+        unresolved_semantic_ids.update(item.get("unresolved_semantic_ids", {}))
+        nonexact_mnemonics.update(item.get("nonexact_mnemonics", {}))
     report = {
         "schema": "airece.evaluation.v1",
         "samples": len(results),
@@ -327,6 +355,10 @@ def main() -> int:
                 if total_instructions else 0.0,
             "block_weighted_exact_percent":
                 round(exact_blocks * 100 / total_blocks, 3) if total_blocks else 0.0,
+            "top_unresolved_semantic_ids":
+                dict(unresolved_semantic_ids.most_common(25)),
+            "top_nonexact_mnemonics":
+                dict(nonexact_mnemonics.most_common(25)),
         },
         "results": results,
     }

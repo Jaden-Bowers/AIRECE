@@ -16,14 +16,19 @@ function/call indexes, decode cache, and lazily created symbolic context. Phase
 creating a second semantic IR or invoking Z3. Phase 4 adds deterministic
 presentation variables for arguments, returns, stack/global storage, call
 results, repeated SSA values, and memory-backed buffers. Every inferred name
-and type retains XAIR evidence and confidence. Phase 5 adds the primary
+and type retains XAIR evidence and confidence. Storage locations, addresses,
+and accessed data are separate identities, so a load/store cannot reuse an
+address as its source-level data value. Phase 5 adds the primary
 budgeted compact function view with stable statement/evidence IDs, calls,
 control, memory, references, unresolved behavior, semantic coverage, and
 continuation hints. Phase 6 adds conservative display-only control regions
 over `xair_cfg` analyses. Pseudocode emits a structured `if` only when both
-arms and their join can be certified; loops, unresolved switches, irreducible
-regions, and limited graphs retain function-qualified labels and gotos. Switch
-destination addresses are never presented as case constants.
+arms and their join can be certified. Two-node natural loops are structured
+only when their entry, back edge, and exit are unambiguous. Switches are
+structured only when XAIR CFG supplies a complete bounded index-to-target map;
+otherwise loops, switches, irreducible regions, and limited graphs retain
+function-qualified labels and gotos. Switch destination addresses are never
+presented as case constants.
 Phase 7 adds a compiled-in, versioned Windows API signature set over
 `xair_sym_model_identity` and model kinds. It annotates arguments, returns,
 constants, effects, taint roles, no-return behavior, and handle relationships;

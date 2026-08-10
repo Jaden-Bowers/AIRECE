@@ -284,6 +284,15 @@ void test_function_variables() {
         expect(stack_slots[0]->stable_id != stack_slots[1]->stable_id &&
                    stack_slots[0]->name.text != stack_slots[1]->name.text,
                "overlapping slots have distinct stable identities and names");
+        for (const airece::PresentationVariable* slot : stack_slots) {
+            expect(!slot->address_values.empty() && !slot->data_values.empty(),
+                   "stack storage separates address and accessed-data identities");
+            for (const xair_value_id address : slot->address_values) {
+                expect(std::find(slot->data_values.begin(), slot->data_values.end(),
+                                 address) == slot->data_values.end(),
+                       "a stack address is never also presented as stored data");
+            }
+        }
     }
 
     const auto arguments = find_kind(view, airece::VariableKind::argument);
@@ -310,6 +319,9 @@ void test_function_variables() {
         expect((*named_global)->address == UINT64_C(0x140005000) &&
                    (*named_global)->storage_bits == 8,
                "global identity retains exact address and access width");
+        expect(!(*named_global)->address_values.empty() &&
+                   !(*named_global)->data_values.empty(),
+               "global storage separates address and accessed-data identities");
     }
 
     std::unordered_set<std::string> stable_ids;

@@ -65,6 +65,16 @@ std::string render_semantic_json(
                 if (value != 0) out << ',';
                 out << variable.values[value];
             }
+            out << "],\"address_values\":[";
+            for (std::size_t value = 0; value < variable.address_values.size(); ++value) {
+                if (value != 0) out << ',';
+                out << variable.address_values[value];
+            }
+            out << "],\"data_values\":[";
+            for (std::size_t value = 0; value < variable.data_values.size(); ++value) {
+                if (value != 0) out << ',';
+                out << variable.data_values[value];
+            }
             out << "]}";
         }
         out << ']';
@@ -80,7 +90,15 @@ std::string render_semantic_json(
         ",\"unresolved_operations\":" << view.coverage.unresolved_operations <<
         ",\"exact_percent\":" << view.coverage.exact_percent <<
         ",\"exact_instruction_percent\":" <<
-            view.coverage.exact_instruction_percent << "}";
+            view.coverage.exact_instruction_percent <<
+        ",\"nonexact_mnemonics\":{";
+    for (std::size_t index = 0;
+         index < view.coverage.nonexact_mnemonics.size(); ++index) {
+        if (index != 0) out << ',';
+        quoted(out, view.coverage.nonexact_mnemonics[index].first);
+        out << ':' << view.coverage.nonexact_mnemonics[index].second;
+    }
+    out << "}}";
     out << ",\"omitted\":{\"calls\":" << view.omitted.calls <<
         ",\"branches\":" << view.omitted.branches <<
         ",\"statements\":" << view.omitted.statements <<
@@ -95,6 +113,7 @@ std::string render_semantic_json(
         out << "{\"id\":"; quoted(out, statement.stable_id);
         out << ",\"kind\":"; quoted(out, semantic_statement_kind_name(statement.kind));
         out << ",\"text\":"; quoted(out, statement.text);
+        out << ",\"semantic_id\":"; quoted(out, statement.semantic_id);
         out << ",\"address\":\"0x" << std::hex << statement.address << std::dec <<
             "\",\"node\":" << statement.node << ",\"block\":" << statement.block <<
             ",\"evidence\":"; quoted(out, statement.evidence_id);
@@ -156,7 +175,21 @@ std::string render_semantic_json(
         out << "{\"id\":"; quoted(out, region.stable_id);
         out << ",\"kind\":"; quoted(out, control_region_kind_name(region.kind));
         out << ",\"header\":" << region.header << ",\"join\":" << region.join <<
-            ",\"condition\":" << region.condition << ",\"nodes\":[";
+            ",\"condition_node\":" << region.condition_node <<
+            ",\"condition\":" << region.condition <<
+            ",\"switch_mapping_complete\":" <<
+                (region.switch_mapping_complete ? "true" : "false") <<
+            ",\"switch_cases\":[";
+        for (std::size_t item = 0; item < region.switch_cases.size(); ++item) {
+            if (item != 0) out << ',';
+            out << "{\"value\":" << region.switch_cases[item].value <<
+                ",\"target\":" << region.switch_cases[item].target <<
+                ",\"raw_target\":\"0x" << std::hex <<
+                region.switch_cases[item].raw_target << std::dec << "\"}";
+        }
+        out << "],\"switch_default\":" << region.switch_default <<
+            ",\"switch_default_raw\":\"0x" << std::hex <<
+                region.switch_default_raw << std::dec << "\",\"nodes\":[";
         for (std::size_t node = 0; node < region.nodes.size(); ++node) {
             if (node != 0) out << ',';
             out << region.nodes[node];
@@ -172,7 +205,10 @@ std::string render_semantic_json(
         out << ",\"source\":" << transfer.source << ",\"target\":" <<
             transfer.target << ",\"condition\":" << transfer.condition <<
             ",\"raw_target\":\"0x" << std::hex << transfer.raw_target << std::dec <<
-            "\",\"explicit_goto\":" <<
+            "\",\"conditional\":" << (transfer.conditional ? "true" : "false") <<
+            ",\"condition_when_true\":" <<
+                (transfer.condition_when_true ? "true" : "false") <<
+            ",\"explicit_goto\":" <<
             (transfer.explicit_goto ? "true" : "false") << "}";
     }
     out << "]}";

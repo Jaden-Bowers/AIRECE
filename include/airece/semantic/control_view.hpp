@@ -51,13 +51,24 @@ struct ControlEvidence {
     bool synthetic{true};
 };
 
+struct ControlSwitchCase {
+    std::int64_t value{};
+    xair_cfg_node_id target{XAIR_CFG_INVALID_ID};
+    std::uint64_t raw_target{};
+};
+
 struct ControlRegion {
     std::string stable_id;
     ControlRegionKind kind{ControlRegionKind::block};
     xair_cfg_node_id header{XAIR_CFG_INVALID_ID};
     xair_cfg_node_id join{XAIR_CFG_INVALID_ID};
+    xair_cfg_node_id condition_node{XAIR_CFG_INVALID_ID};
     xair_value_id condition{XAIR_INVALID_ID};
     std::vector<xair_cfg_node_id> nodes;
+    std::vector<ControlSwitchCase> switch_cases;
+    xair_cfg_node_id switch_default{XAIR_CFG_INVALID_ID};
+    std::uint64_t switch_default_raw{};
+    bool switch_mapping_complete{};
     ControlEvidence evidence;
 };
 
@@ -68,6 +79,8 @@ struct ControlTransfer {
     xair_cfg_node_id target{XAIR_CFG_INVALID_ID};
     xair_value_id condition{XAIR_INVALID_ID};
     std::uint64_t raw_target{};
+    bool conditional{};
+    bool condition_when_true{};
     bool explicit_goto{};
     ControlEvidence evidence;
 };

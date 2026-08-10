@@ -403,6 +403,8 @@ void test_cleanup_boolean_flags_and_unknown() {
     xair_value_id rhs = XAIR_INVALID_ID;
     xair_value_id flags = XAIR_INVALID_ID;
     xair_value_id zero_flag = XAIR_INVALID_ID;
+    xair_value_id true_value = XAIR_INVALID_ID;
+    xair_value_id nonzero_flag = XAIR_INVALID_ID;
     xair_value_id unknown = XAIR_INVALID_ID;
     require_xair(xair_block_add_param(
         owner.module, owner.block, xair_type_i(8), "byte", &byte), "byte param");
@@ -429,6 +431,11 @@ void test_cleanup_boolean_flags_and_unknown() {
     require_xair(xair_build_unary(
         owner.module, owner.block, XAIR_OP_FLAG_ZF, xair_type_i(1),
         flags, "zf", &zero_flag), "zero flag");
+    require_xair(xair_build_const_u64(
+        owner.module, owner.block, xair_type_i(1), 1, "true", &true_value), "true");
+    require_xair(xair_build_binary(
+        owner.module, owner.block, XAIR_OP_XOR, xair_type_i(1),
+        zero_flag, true_value, "not_zf", &nonzero_flag), "invert zero flag");
     require_xair(xair_build_unknown(
         owner.module, owner.block, xair_type_i(17),
         "unsupported.opcode", "unknown17", &unknown), "unknown");
@@ -438,8 +445,10 @@ void test_cleanup_boolean_flags_and_unknown() {
            "truncation of a matching extension is cleaned up");
     expect(recovery.build(negated).text == "!condition",
            "comparison against false becomes boolean negation");
-    expect(recovery.build(zero_flag).text == "lhs - rhs == 0",
-           "flag expression becomes its arithmetic condition");
+    expect(recovery.build(zero_flag).text == "lhs == rhs",
+           "subtraction zero flag becomes a direct equality");
+    expect(recovery.build(nonzero_flag).text == "lhs != rhs",
+           "boolean inversion produces the inverse direct comparison");
     const airece::SemanticExpression unknown_expression = recovery.build(unknown);
     expect(unknown_expression.text == "unknown<bits17>(unsupported.opcode)",
            "unknown operation remains explicit with exact width");

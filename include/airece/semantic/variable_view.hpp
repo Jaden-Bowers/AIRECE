@@ -81,6 +81,10 @@ struct PresentationVariable {
     std::uint32_t roles{variable_role_none};
     xair_value_id primary_value{XAIR_INVALID_ID};
     std::vector<xair_value_id> values;
+    /* Storage variables deliberately keep location identities separate from
+     * the values read from or written to that location. */
+    std::vector<xair_value_id> address_values;
+    std::vector<xair_value_id> data_values;
     PresentationName name;
     PresentationType type;
     VariableEvidence evidence;

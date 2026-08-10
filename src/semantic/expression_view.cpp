@@ -399,6 +399,22 @@ struct ExpressionRecovery::Impl {
         return true;
     }
 
+    static Rendered negate_boolean(Rendered expression) {
+        if (expression.precedence == precedence_compare) {
+            constexpr std::pair<std::string_view, std::string_view> inverses[] = {
+                {" == ", " != "}, {" != ", " == "},
+                {" u< ", " u>= "}, {" u<= ", " u> "},
+                {" s< ", " s>= "}, {" s<= ", " s> "}};
+            for (const auto& [from, to] : inverses) {
+                const std::size_t position = expression.text.find(from);
+                if (position == std::string::npos) continue;
+                expression.text.replace(position, from.size(), to);
+                return expression;
+            }
+        }
+        return {'!' + parenthesize(expression, precedence_unary), precedence_unary};
+    }
+
     Rendered render_comparison(
         const xair_value_id* inputs,
         const std::size_t count,
@@ -419,7 +435,7 @@ struct ExpressionRecovery::Impl {
                 Rendered expression = operand(inputs[other], horizon, depth, state);
                 const bool negate = (opcode == XAIR_OP_EQ) != constant;
                 if (negate) {
-                    return {'!' + parenthesize(expression, precedence_unary), precedence_unary};
+                    return negate_boolean(std::move(expression));
                 }
                 return expression;
             }
@@ -462,6 +478,14 @@ struct ExpressionRecovery::Impl {
                     precedence_atom};
         }
         track_operation(state, definition);
+        if (sub && count >= 2 && flag_opcode == XAIR_OP_FLAG_ZF) {
+            return render_binary(
+                inputs, count, "==", precedence_compare, horizon, depth, state);
+        }
+        if (sub && count >= 2 && flag_opcode == XAIR_OP_FLAG_CF) {
+            return render_binary(
+                inputs, count, "u<", precedence_compare, horizon, depth, state);
+        }
         Rendered arithmetic;
         if (logic) {
             arithmetic = operand(inputs[0], horizon, depth, state);
@@ -591,8 +615,22 @@ struct ExpressionRecovery::Impl {
             return render_binary(inputs, count, "&", precedence_and, horizon, depth, state);
         case XAIR_OP_OR:
             return render_binary(inputs, count, "|", precedence_or, horizon, depth, state);
-        case XAIR_OP_XOR:
+        case XAIR_OP_XOR: {
+            if (count >= 2 && type.bits == 1) {
+                bool constant = false;
+                std::size_t other = 0;
+                bool found = constant_boolean(inputs[1], constant);
+                if (!found) {
+                    found = constant_boolean(inputs[0], constant);
+                    other = 1;
+                }
+                if (found) {
+                    Rendered expression = operand(inputs[other], horizon, depth, state);
+                    return constant ? negate_boolean(std::move(expression)) : expression;
+                }
+            }
             return render_binary(inputs, count, "^", precedence_xor, horizon, depth, state);
+        }
         case XAIR_OP_SHL:
             return render_binary(inputs, count, "<<", precedence_shift, horizon, depth, state);
         case XAIR_OP_LSHR:

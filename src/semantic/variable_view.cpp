@@ -173,6 +173,8 @@ struct VariableRecovery::Impl {
     struct StorageRecord {
         xair_value_id primary{XAIR_INVALID_ID};
         std::vector<xair_value_id> values;
+        std::vector<xair_value_id> address_values;
+        std::vector<xair_value_id> data_values;
         std::vector<xair_op_id> operations;
         xair_type data_type{XAIR_TYPE_INVALID, 0, 0};
         bool overlap{};
@@ -904,6 +906,8 @@ struct VariableRecovery::Impl {
                         if (record.data_type.kind == XAIR_TYPE_INVALID) record.data_type = data_type;
                         append_unique_value(record.values, address);
                         append_unique_value(record.values, accessed_value);
+                        append_unique_value(record.address_values, address);
+                        append_unique_value(record.data_values, accessed_value);
                         append_unique_op(record.operations, operation);
                         if (address < candidates.size()) candidates[address].suppress_buffer = true;
                     } else {
@@ -916,6 +920,8 @@ struct VariableRecovery::Impl {
                             if (record.data_type.kind == XAIR_TYPE_INVALID) record.data_type = data_type;
                             append_unique_value(record.values, address);
                             append_unique_value(record.values, accessed_value);
+                            append_unique_value(record.address_values, address);
+                            append_unique_value(record.data_values, accessed_value);
                             append_unique_op(record.operations, operation);
                             if (address < candidates.size()) candidates[address].suppress_buffer = true;
                         } else if (options.include_buffers && address < value_count) {
@@ -1066,6 +1072,8 @@ struct VariableRecovery::Impl {
                 (argument ? variable_role_argument : variable_role_none);
             variable.primary_value = record.primary;
             variable.values = record.values;
+            variable.address_values = record.address_values;
+            variable.data_values = record.data_values;
             variable.stack_offset = key.offset;
             variable.storage_bits = key.bits;
             variable.storage_identity = true;
@@ -1084,11 +1092,11 @@ struct VariableRecovery::Impl {
                     : "affine stack base and exact byte offset");
             variable.type = type_for_storage(
                 record.data_type, key.bits, record.operations,
-                std::any_of(record.values.begin(), record.values.end(),
+                std::any_of(record.data_values.begin(), record.data_values.end(),
                     [&](const xair_value_id value) {
                         return value < candidates.size() && candidates[value].signed_context;
                     }),
-                std::any_of(record.values.begin(), record.values.end(),
+                std::any_of(record.data_values.begin(), record.data_values.end(),
                     [&](const xair_value_id value) {
                         return value < candidates.size() && candidates[value].unsigned_context;
                     }),
@@ -1105,6 +1113,8 @@ struct VariableRecovery::Impl {
             variable.roles = variable_role_global;
             variable.primary_value = record.primary;
             variable.values = record.values;
+            variable.address_values = record.address_values;
+            variable.data_values = record.data_values;
             variable.address = key.address;
             variable.storage_bits = key.bits;
             variable.storage_identity = true;
@@ -1124,11 +1134,11 @@ struct VariableRecovery::Impl {
             }
             variable.type = type_for_storage(
                 record.data_type, key.bits, record.operations,
-                std::any_of(record.values.begin(), record.values.end(),
+                std::any_of(record.data_values.begin(), record.data_values.end(),
                     [&](const xair_value_id value) {
                         return value < candidates.size() && candidates[value].signed_context;
                     }),
-                std::any_of(record.values.begin(), record.values.end(),
+                std::any_of(record.data_values.begin(), record.data_values.end(),
                     [&](const xair_value_id value) {
                         return value < candidates.size() && candidates[value].unsigned_context;
                     }),

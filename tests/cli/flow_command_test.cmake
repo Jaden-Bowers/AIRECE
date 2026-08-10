@@ -78,7 +78,7 @@ execute_process(COMMAND "${AIRECE_EXE}" flow "${FIXTURE}"
 if(NOT _sym_result EQUAL 0 AND NOT _sym_result EQUAL 3)
     message(FATAL_ERROR "symbolic flow failed (${_sym_result}): ${_sym_error}")
 endif()
-foreach(_required IN ITEMS "verdict=feasible-flow" "constraint rax - rbx == 0"
+foreach(_required IN ITEMS "verdict=feasible-flow" "constraint rax == rbx"
         "source-constrained=yes" "solver=initialized" "witness source=0")
     string(FIND "${_sym}" "${_required}" _found)
     if(_found EQUAL -1)

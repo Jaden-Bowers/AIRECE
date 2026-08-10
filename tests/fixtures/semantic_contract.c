@@ -2,8 +2,10 @@
 
 #if defined(_MSC_VER)
 #define AIRECE_EXPORT __declspec(dllexport) __declspec(noinline)
+#define AIRECE_NOINLINE __declspec(noinline)
 #else
 #define AIRECE_EXPORT __attribute__((visibility("default"), noinline))
+#define AIRECE_NOINLINE __attribute__((noinline))
 #endif
 
 #if defined(AIRECE_RTC_STUBS)
@@ -43,11 +45,49 @@ AIRECE_EXPORT int airece_semantic_switch(unsigned value) {
     }
 }
 
+static AIRECE_NOINLINE int dense_case0(unsigned value) { return (int)value + 11; }
+static AIRECE_NOINLINE int dense_case1(unsigned value) { return (int)value * 3; }
+static AIRECE_NOINLINE int dense_case2(unsigned value) { return (int)value - 19; }
+static AIRECE_NOINLINE int dense_case3(unsigned value) { return (int)(value ^ 0x55U); }
+static AIRECE_NOINLINE int dense_case4(unsigned value) { return (int)value + 101; }
+static AIRECE_NOINLINE int dense_case5(unsigned value) { return (int)value - 7; }
+
+AIRECE_EXPORT int airece_semantic_dense_switch(unsigned value) {
+    switch (value) {
+    case 0: return dense_case0(value);
+    case 1: return dense_case1(value);
+    case 2: return dense_case2(value);
+    case 3: return dense_case3(value);
+    case 4: return dense_case4(value);
+    case 5: return dense_case5(value);
+    default: return -313;
+    }
+}
+
+AIRECE_EXPORT int airece_semantic_loop(const int* values, unsigned count) {
+    int sum = 0;
+    unsigned index = 0;
+    while (index < count) {
+        sum += values[index];
+        ++index;
+    }
+    return sum;
+}
+
+AIRECE_EXPORT int airece_semantic_storage(int input) {
+    volatile int slot = input + 1;
+    slot = slot * 3;
+    return slot;
+}
+
 /* A CRT-free DLL entry seeds CFG discovery and keeps all three semantic
  * contracts reachable.  It is analyzed, never loaded or executed by tests. */
 AIRECE_EXPORT int airece_semantic_entry(void) {
     uint64_t value = UINT64_C(11);
     return (int)airece_semantic_load(&value) +
         airece_semantic_branch((int)value) +
-        airece_semantic_switch((unsigned)value);
+        airece_semantic_switch((unsigned)value) +
+        airece_semantic_dense_switch((unsigned)value) +
+        airece_semantic_loop((const int*)&value, 1) +
+        airece_semantic_storage((int)value);
 }
