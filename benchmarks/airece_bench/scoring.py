@@ -282,13 +282,13 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
         output["groups"]["/".join(key)] = group
         group["rates"] = {
             "objective_accuracy": group.get("fields_correct", 0) / group.get("fields_total", 1)
-                if task == "objective" else None,
+                if task == "objective" and group.get("fields_total", 0) else 0.0,
             "evidence_validity": group.get("evidence_valid", 0) / group.get("evidence_total", 1)
                 if task == "objective" and group.get("evidence_total", 0) else 0.0,
             "unsupported_claim": group.get("unsupported_claims", 0) / group.get("claims", 1)
                 if task == "objective" and group.get("claims", 0) else 0.0,
             "explicit_unknown": group.get("unknown_fields", 0) / group.get("fields_total", 1)
-                if task == "objective" else None,
+                if task == "objective" and group.get("fields_total", 0) else 0.0,
             "compile": group.get("compiled", 0) / group["runs"] if task == "reconstruction" else None,
             "behavioral": group.get("tests_passed", 0) / group.get("tests_total", 1)
                 if task == "reconstruction" and group.get("tests_total", 0) else None}

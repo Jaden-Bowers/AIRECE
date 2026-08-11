@@ -14,7 +14,8 @@ from benchmarks.airece_bench.prompts import (extract_sections, instructions,
 from benchmarks.airece_bench.lmstudio import LMStudioAdapter
 from benchmarks.airece_bench.runner import _records, rebuild_jsonl
 from benchmarks.airece_bench.scoring import (extract_c_function, extract_json,
-                                             score_objective, validate_objective)
+                                             score_objective, summarize,
+                                             validate_objective)
 from benchmarks.airece_bench.util import atomic_write_json, canonical_json, sha256_bytes
 
 
@@ -111,6 +112,16 @@ class ResumeTests(unittest.TestCase):
                 "run_id": "heldout", "config_fingerprint": "same", "case_id": "heldout"})
             records = _records(root, "same", {"heldout"})
             self.assertEqual([item["run_id"] for item in records], ["heldout"])
+
+    def test_all_failure_summary_has_zero_rates(self) -> None:
+        result = summarize([{
+            "run_id": "failed", "case_id": "case", "repetition": 0,
+            "track": "common", "task": "objective", "condition": "airece",
+            "failure": {"type": "Unavailable", "message": "offline"},
+        }])
+        group = result["groups"]["common/airece/objective"]
+        self.assertEqual(group["rates"]["objective_accuracy"], 0.0)
+        self.assertEqual(group["rates"]["explicit_unknown"], 0.0)
 
 
 class ToolBudgetTests(unittest.TestCase):
