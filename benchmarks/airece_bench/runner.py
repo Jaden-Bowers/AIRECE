@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 import random
-import re
-import sys
 import time
 from typing import Any
 
@@ -24,14 +21,19 @@ def git(root: pathlib.Path, *arguments: str) -> str | None:
     return result["stdout"].strip() if result["exit"] == 0 else None
 
 
-def _records(output: pathlib.Path, config_fingerprint: str | None = None) -> list[dict[str, Any]]:
+def _records(output: pathlib.Path, config_fingerprint: str | None = None,
+             case_ids: set[str] | None = None) -> list[dict[str, Any]]:
     records = []
     for path in sorted((output / "records").glob("*.json")) if (output / "records").is_dir() else []:
         try:
             record = load_json(path)
-            if config_fingerprint is None or record.get("config_fingerprint") == config_fingerprint:
+            matches_config = (config_fingerprint is None or
+                              record.get("config_fingerprint") == config_fingerprint)
+            matches_case = case_ids is None or record.get("case_id") in case_ids
+            if matches_config and matches_case:
                 records.append(record)
-        except (OSError, json.JSONDecodeError): continue
+        except (OSError, json.JSONDecodeError):
+            continue
     return records
 
 
@@ -102,7 +104,7 @@ class BenchmarkRunner:
         self.analyzer_report_path = resolve(root, self.config["paths"]["analyzer_report"])
         self.sections = extract_sections(resolve(root, self.config["paths"]["instruction_packs"]))
 
-    def preflight(self, max_cases: int, repetitions: int,
+    def preflight(self, max_cases: int, repetitions: int, split: str,
                   rebuild_corpus: bool = True) -> tuple[dict[str, Any], list[dict[str, Any]],
                                                        GhidraExtractor, LMStudioAdapter]:
         health = load_json(self.analyzer_report_path)
@@ -127,14 +129,18 @@ class BenchmarkRunner:
                 raise RuntimeError(f"dependency revision changed since health report: {name}")
         corpus_manifest = build_corpus(self.root, self.config, self.output) if rebuild_corpus else \
             load_json(self.output / "corpus" / "manifest.json")
-        cases = [item for item in corpus_manifest["cases"] if item["split"] == "heldout"]
+        if split not in {"development", "heldout"}:
+            raise ValueError(f"unsupported corpus split: {split}")
+        cases = [item for item in corpus_manifest["cases"] if item["split"] == split]
+        random.Random(self.config["corpus"]["seed"]).shuffle(cases)
         cases = cases[:max_cases] if max_cases > 0 else cases
         ghidra = GhidraExtractor(resolve(self.root, self.config["paths"]["ghidra_root"]),
             self.root / "benchmarks" / "ghidra" / "AireceBenchmarkExport.java",
             self.output / "cache" / "ghidra", self.config["budgets"]["ghidra_timeout_seconds"])
         lm = LMStudioAdapter(self.config["model"], self.config["budgets"]["task_timeout_seconds"],
-                             [str(self.root), *(str(pathlib.Path(item["binary"]).parent)
-                                                for item in cases)])
+                             [str(self.root),
+                              *(str(pathlib.Path(item["binary"]).parent) for item in cases),
+                              *(pathlib.Path(item["binary"]).name for item in cases)])
         model_metadata = lm.probe()
         native_smoke = lm.native_chat_smoke()
         version = run(["lms", "--version"], self.root, 10)
@@ -162,7 +168,7 @@ class BenchmarkRunner:
                                   for name, text in self.sections.items()},
             "corpus": {"manifest": str(self.output / "corpus" / "manifest.json"),
                        "manifest_sha256": sha256_file(self.output / "corpus" / "manifest.json"),
-                       "total_cases": len(corpus_manifest["cases"]),
+                       "total_cases": len(corpus_manifest["cases"]), "split": split,
                        "selected_cases": len(cases), "artifacts": corpus_manifest["artifacts"]},
             "repetitions": repetitions, "failures": [], "skipped": []}
         manifest["analyzer"]["source_delta_from_tag"] = delta
@@ -186,21 +192,26 @@ class BenchmarkRunner:
         return jobs
 
     def execute(self, max_cases: int, repetitions: int, dry_run: bool = False,
+                split: str = "heldout",
                 rebuild_corpus: bool = True) -> dict[str, Any]:
         if dry_run:
             corpus_path = self.output / "corpus" / "manifest.json"
             corpus = load_json(corpus_path) if corpus_path.is_file() else \
                 build_corpus(self.root, self.config, self.output)
-            cases = [item for item in corpus["cases"] if item["split"] == "heldout"][:max_cases]
+            cases = [item for item in corpus["cases"] if item["split"] == split]
+            random.Random(self.config["corpus"]["seed"]).shuffle(cases)
+            cases = cases[:max_cases] if max_cases > 0 else cases
             plan = self.plan(cases, repetitions)
             return {"dry_run": True, "jobs": len(plan),
                     "order": [{key: item[key] for key in ("case_id", "repetition", "track",
                                                            "task", "condition", "condition_order")}
                               for item in plan]}
-        manifest, cases, ghidra, lm = self.preflight(max_cases, repetitions, rebuild_corpus)
+        manifest, cases, ghidra, lm = self.preflight(
+            max_cases, repetitions, split, rebuild_corpus)
         self.output.mkdir(parents=True, exist_ok=True)
         atomic_write_json(self.output / "manifest.json", manifest)
         config_fingerprint = sha256_bytes(canonical_json(self.config).encode("utf-8"))
+        selected_case_ids = {case["case_id"] for case in cases}
         for job in self.plan(cases, repetitions):
             case = job["case"]
             schemas = tool_schema(job["track"], job["condition"])
@@ -223,7 +234,7 @@ class BenchmarkRunner:
                 continue
             binary = pathlib.Path(case["binary"])
             record: dict[str, Any] = {"schema": "airece.ai-utility-run.v1", "run_id": run_id,
-                "config_fingerprint": config_fingerprint,
+                "config_fingerprint": config_fingerprint, "split": split,
                 **{key: job[key] for key in ("case_id", "repetition", "track", "task",
                                              "condition", "condition_order")},
                 "binary_sha256": case["binary_sha256"],
@@ -245,10 +256,16 @@ class BenchmarkRunner:
                     ghidra_document, extraction = backend.document, backend.extraction
                 bounds = _function_bounds(ghidra_document, case["target_address"])
                 record["ghidra_extraction"] = extraction
-                model = lm.run_tools(visible, task_prompt, schemas,
-                    lambda name, arguments: backend.execute(name, arguments, job["track"]),
-                    self.config["budgets"]["max_tool_calls"],
-                    self.config["budgets"]["max_input_bytes"])
+                def execute_tool(name: str, arguments: dict[str, Any]) -> str:
+                    return backend.execute(name, arguments, job["track"])
+                if self.config["model"].get("tool_transport") == "json-protocol":
+                    model = lm.run_json_protocol(visible, task_prompt, schemas,
+                        execute_tool, self.config["budgets"]["max_tool_calls"],
+                        self.config["budgets"]["max_input_bytes"])
+                else:
+                    model = lm.run_tools(visible, task_prompt, schemas,
+                        execute_tool, self.config["budgets"]["max_tool_calls"],
+                        self.config["budgets"]["max_input_bytes"])
                 record["model"] = model
                 if job["task"] == "objective":
                     record["score"] = score_objective(model["final_text"], case["truth"],
@@ -262,8 +279,9 @@ class BenchmarkRunner:
                 record["failure"] = {"type": type(error).__name__, "message": str(error)}
             record["end_to_end_ms"] = round((time.perf_counter() - run_started) * 1000, 3)
             atomic_write_json(record_path, record)
-            rebuild_jsonl(self.output, _records(self.output, config_fingerprint))
-        records = _records(self.output, config_fingerprint)
+            rebuild_jsonl(self.output, _records(
+                self.output, config_fingerprint, selected_case_ids))
+        records = _records(self.output, config_fingerprint, selected_case_ids)
         summary = summarize(records)
         atomic_write_json(self.output / "summary.json", summary)
         failures = [{"run_id": item["run_id"], **item["failure"]}

@@ -13,6 +13,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-cases", type=int, default=2)
     parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument("--split", choices=("development", "heldout"), default="heldout")
     parser.add_argument("--no-rebuild-corpus", action="store_true")
     parser.add_argument("--task-timeout-seconds", type=float)
     parser.add_argument("--analyzer-timeout-seconds", type=float)
@@ -26,11 +27,11 @@ def main(argv: list[str] | None = None) -> int:
          "compile_timeout_seconds", "execute_timeout_seconds")}
     runner = BenchmarkRunner(root, (root / arguments.config).resolve(), overrides)
     result = runner.execute(arguments.max_cases, arguments.repetitions,
-                            arguments.dry_run, not arguments.no_rebuild_corpus)
+                            arguments.dry_run, arguments.split,
+                            not arguments.no_rebuild_corpus)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

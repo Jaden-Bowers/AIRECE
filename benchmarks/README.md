@@ -27,7 +27,8 @@ python tools/benchmark_analyzer.py `
   --output out/benchmark-analyzer-quick.json
 ```
 
-Build the deterministic MSVC/clang-cl O0/O2 corpus and run tests:
+Build the deterministic MSVC/clang-cl O0/O2 corpus across no-CRT, static-CRT,
+and dynamic-CRT variants, then run tests:
 
 ```powershell
 python -m benchmarks.airece_bench.corpus
@@ -37,21 +38,26 @@ python -m unittest discover -s benchmarks/tests -v
 Inspect the deterministically randomized smoke plan, then execute it:
 
 ```powershell
-python -m benchmarks.airece_bench.cli --dry-run --max-cases 2 --repetitions 1
-python -m benchmarks.airece_bench.cli --max-cases 2 --repetitions 1
+python -m benchmarks.airece_bench.cli --dry-run --split development --max-cases 2 --repetitions 1
+python -m benchmarks.airece_bench.cli --split development --max-cases 2 --repetitions 1
 ```
 
 Resume the same run without rebuilding the corpus:
 
 ```powershell
-python -m benchmarks.airece_bench.cli --max-cases 2 --repetitions 1 --no-rebuild-corpus
+python -m benchmarks.airece_bench.cli --split development --max-cases 2 --repetitions 1 --no-rebuild-corpus
 ```
 
-A bounded preliminary run, only after smoke transcripts pass leakage review:
+A detached 20-case held-out run with three repetitions, only after development
+smoke transcripts pass leakage review:
 
 ```powershell
-python -m benchmarks.airece_bench.cli --max-cases 12 --repetitions 3
+python benchmarks/launch_detached.py --max-cases 20 --repetitions 3
 ```
+
+The launcher records the child PID and exact command in
+`out/ai-utility-benchmark/detached-run.json`; stdout and stderr are retained next
+to it. Development records are excluded from held-out summaries and reports.
 
 All stage timeouts can be overridden with `--task-timeout-seconds`,
 `--analyzer-timeout-seconds`, `--ghidra-timeout-seconds`,
@@ -61,4 +67,3 @@ defaults are checked in at `benchmarks/config.json`.
 Outputs are `manifest.json`, `runs.jsonl`, `summary.json`, and `report.md` in
 `out/ai-utility-benchmark`. Individual atomic records are retained in the
 `records` subdirectory, and raw Ghidra exports are retained under `cache`.
-

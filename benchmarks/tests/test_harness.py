@@ -102,6 +102,16 @@ class ResumeTests(unittest.TestCase):
                      (root / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual([item["run_id"] for item in lines], ["a", "b"])
 
+    def test_records_can_be_isolated_to_selected_cases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            atomic_write_json(root / "records" / "dev.json", {
+                "run_id": "dev", "config_fingerprint": "same", "case_id": "development"})
+            atomic_write_json(root / "records" / "heldout.json", {
+                "run_id": "heldout", "config_fingerprint": "same", "case_id": "heldout"})
+            records = _records(root, "same", {"heldout"})
+            self.assertEqual([item["run_id"] for item in records], ["heldout"])
+
 
 class ToolBudgetTests(unittest.TestCase):
     def test_exhausted_budget_forces_final_turn(self) -> None:
@@ -123,6 +133,30 @@ class ToolBudgetTests(unittest.TestCase):
         self.assertEqual(result["final_text"], "done")
         self.assertEqual(result["requests"][1]["tool_choice"], "none")
         self.assertEqual(len(result["tool_events"]), 1)
+
+    def test_json_protocol_tool_then_final(self) -> None:
+        adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
+            "responses_path": "/v1/responses", "native_chat_path": "/api/v1/chat",
+            "temperature": 0, "seed": 1, "max_output_tokens": 32,
+            "reasoning": {"effort": "none"}}, 10)
+        adapter.base_url = "http://unused"
+        responses = iter([
+            {"id": "one", "status": "completed", "usage": {}, "output": [{
+                "type": "message", "content": [{"type": "output_text",
+                    "text": '{"action":"tool","name":"echo","arguments":{"value":"OK"}}'}]}]},
+            {"id": "two", "status": "completed", "usage": {}, "output": [{
+                "type": "message", "content": [{"type": "output_text",
+                    "text": '{"action":"final","content":"OK"}'}]}]},
+        ])
+        adapter._request = lambda *args, **kwargs: (next(responses), {}, 1.0)  # type: ignore[method-assign]
+        tools = [{"type": "function", "name": "echo", "description": "Echo",
+                  "parameters": {"type": "object", "properties": {}}}]
+        result = adapter.run_json_protocol(
+            "instructions", "input", tools,
+            lambda name, args: '{"value":"OK"}', 2, 10000)
+        self.assertEqual(result["final_text"], "OK")
+        self.assertEqual(result["transport"], "json-protocol")
+        self.assertEqual(result["tool_events"][0]["name"], "echo")
 
 
 if __name__ == "__main__":

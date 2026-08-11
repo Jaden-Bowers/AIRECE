@@ -7,11 +7,30 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
+from .prompts import prompt_snapshot
 from .util import canonical_json, text_size
 
 
 class LMStudioError(RuntimeError):
     pass
+
+
+def json_protocol_instructions(tools: list[dict[str, Any]]) -> str:
+    catalog = [{"name": item["name"], "description": item.get("description", ""),
+                "parameters": item.get("parameters", {})} for item in tools]
+    return """
+The controller uses a strict JSON tool protocol because the local runner's
+multi-turn native function-call template is not reliable. On every turn return
+exactly one JSON object and no markdown or surrounding text. To request a tool:
+{"action":"tool","name":"TOOL_NAME","arguments":{}}
+To finish:
+{"action":"final","content":FINAL_VALUE}
+FINAL_VALUE must be the exact requested final answer: an object for a JSON task
+or a string containing source code for a reconstruction task. Request only a
+tool in the catalog below. After a tool result, either request another catalog
+tool or finish. Never emit XML/tool-call tags.
+Tool catalog:
+""" + canonical_json(catalog) + "\n"
 
 
 class LMStudioAdapter:
@@ -212,5 +231,127 @@ class LMStudioAdapter:
             if exhausted:
                 payload["tools"] = []
                 payload["tool_choice"] = "none"
+            if self.config.get("reasoning") is not None:
+                payload["reasoning"] = self.config["reasoning"]
+
+    @staticmethod
+    def _protocol_object(text: str) -> dict[str, Any] | None:
+        candidate = text.strip()
+        if candidate.startswith("```"):
+            candidate = candidate.split("\n", 1)[1] if "\n" in candidate else candidate
+            if candidate.endswith("```"):
+                candidate = candidate[:-3].rstrip()
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            start, end = candidate.find("{"), candidate.rfind("}")
+            if start < 0 or end <= start:
+                return None
+            try:
+                value = json.loads(candidate[start:end + 1])
+            except json.JSONDecodeError:
+                return None
+        return value if isinstance(value, dict) else None
+
+    def run_json_protocol(self, instructions: str, user_input: str,
+                          tools: list[dict[str, Any]],
+                          executor: Callable[[str, dict[str, Any]], str],
+                          max_tool_calls: int,
+                          max_input_bytes: int = 120000) -> dict[str, Any]:
+        if self.base_url is None:
+            self.probe()
+        protocol = json_protocol_instructions(tools)
+        full_instructions = instructions + "\n" + protocol
+        requests: list[dict[str, Any]] = []
+        responses: list[dict[str, Any]] = []
+        tool_events: list[dict[str, Any]] = []
+        protocol_errors: list[str] = []
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                 "reasoning_tokens": 0, "cached_tokens": 0}
+        payload: dict[str, Any] = {"model": self.config["id"],
+            "instructions": full_instructions, "input": user_input,
+            "temperature": self.config["temperature"], "seed": self.config["seed"],
+            "max_output_tokens": self.config["max_output_tokens"], "store": True}
+        if self.config.get("reasoning") is not None:
+            payload["reasoning"] = self.config["reasoning"]
+        started = time.perf_counter()
+        total_model_ms = 0.0
+        executed_calls = 0
+        turns = 0
+        while True:
+            turns += 1
+            if turns > max_tool_calls + 3:
+                raise LMStudioError("JSON protocol turn budget exhausted")
+            payload_bytes = len(canonical_json(payload).encode("utf-8"))
+            if payload_bytes > max_input_bytes:
+                raise LMStudioError(
+                    f"request envelope exceeds input byte budget: {payload_bytes}>{max_input_bytes}")
+            remaining = self.timeout - (time.perf_counter() - started)
+            if remaining <= 0:
+                raise LMStudioError("task wall-clock budget exhausted")
+            requests.append(self._sanitize(payload))
+            response, headers, elapsed = self._request(
+                "POST", self.config["responses_path"], payload, timeout=max(1, remaining))
+            requests[-1]["_transport_attempts"] = self.last_request_attempts
+            requests[-1]["_utf8_bytes"] = payload_bytes
+            total_model_ms += elapsed
+            responses.append(self._sanitize(response))
+            current = response.get("usage") or {}
+            usage["input_tokens"] += int(current.get("input_tokens") or 0)
+            usage["output_tokens"] += int(current.get("output_tokens") or 0)
+            usage["total_tokens"] += int(current.get("total_tokens") or 0)
+            usage["reasoning_tokens"] += int(
+                (current.get("output_tokens_details") or {}).get("reasoning_tokens") or 0)
+            usage["cached_tokens"] += int(
+                (current.get("input_tokens_details") or {}).get("cached_tokens") or 0)
+            if response.get("status") not in {"completed", "incomplete"}:
+                raise LMStudioError(f"JSON protocol response failed: {response.get('error')}")
+            raw = self._text(response)
+            value = self._protocol_object(raw)
+            if value is None or value.get("action") not in {"tool", "final"}:
+                message = "malformed JSON protocol response"
+                protocol_errors.append(message + ": " + raw[:1000])
+                next_input: dict[str, Any] = {"protocol_error": message,
+                    "required": {"action": "tool or final"},
+                    "remaining_tool_calls": max_tool_calls - executed_calls}
+            elif value["action"] == "final":
+                content = value.get("content")
+                final = content if isinstance(content, str) else canonical_json(content)
+                return {"transport": "json-protocol", "final_text": final,
+                    "usage": usage, "requests": requests, "responses": responses,
+                    "tool_events": tool_events, "protocol_errors": protocol_errors,
+                    "model_elapsed_ms": total_model_ms,
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+                    "final_size": text_size(final),
+                    "response_headers": self._sanitize(headers),
+                    "protocol_instructions": prompt_snapshot(protocol)}
+            else:
+                name = value.get("name")
+                arguments = value.get("arguments")
+                was_executed = False
+                if not isinstance(name, str) or not isinstance(arguments, dict):
+                    result = canonical_json({"ok": False,
+                        "error": "malformed tool request: name string and arguments object required"})
+                    normalized_arguments: dict[str, Any] = {}
+                elif executed_calls >= max_tool_calls:
+                    result = canonical_json({"ok": False, "error": "tool-call budget exhausted"})
+                    normalized_arguments = arguments
+                else:
+                    normalized_arguments = arguments
+                    result = executor(name, arguments)
+                    executed_calls += 1
+                    was_executed = True
+                tool_events.append({"name": name, "arguments": self._sanitize(normalized_arguments),
+                    "executed": was_executed,
+                    "result": self._sanitize(result), "result_size": text_size(result)})
+                next_input = {"tool_result": result,
+                    "remaining_tool_calls": max(0, max_tool_calls - executed_calls),
+                    "instruction": "Return the next strict JSON protocol object."}
+                if executed_calls >= max_tool_calls:
+                    next_input["instruction"] = "Tool budget is exhausted. Return action final now."
+            payload = {"model": self.config["id"],
+                "previous_response_id": response["id"], "input": canonical_json(next_input),
+                "temperature": self.config["temperature"], "seed": self.config["seed"],
+                "max_output_tokens": self.config["max_output_tokens"], "store": True}
             if self.config.get("reasoning") is not None:
                 payload["reasoning"] = self.config["reasoning"]

@@ -165,7 +165,8 @@ def build(root: pathlib.Path, config: dict[str, Any], output: pathlib.Path) -> d
     artifacts: list[dict[str, Any]] = []
     for compiler in config["corpus"]["compilers"]:
         for optimization in config["corpus"]["optimizations"]:
-            label = f"{compiler}-{optimization.lower()}"
+          for crt in config["corpus"].get("crt_variants", ["none"]):
+            label = f"{compiler}-{optimization.lower()}-{crt}"
             directory = build_root / label
             if compiler == "clangcl":
                 release = directory / "Release"
@@ -175,8 +176,12 @@ def build(root: pathlib.Path, config: dict[str, Any], output: pathlib.Path) -> d
                     object_path = release / f"artifact_{language}.obj"
                     binary = release / f"artifact_{language}.dll"
                     compile_command = ["clang-cl", "/nologo", "/c", "/GS-", "/Gy-",
-                                       "/Zl", "/Od" if optimization == "O0" else "/O2",
+                                       "/Od" if optimization == "O0" else "/O2",
                                        f"/Fo{object_path}", str(source)]
+                    if crt == "none":
+                        compile_command.append("/Zl")
+                    else:
+                        compile_command.append("/MT" if crt == "static" else "/MD")
                     if language == "cpp":
                         compile_command.extend(["/GR-", "/EHsc-"])
                     result = run(compile_command, root, 120)
@@ -185,15 +190,23 @@ def build(root: pathlib.Path, config: dict[str, Any], output: pathlib.Path) -> d
                         raise RuntimeError(
                             f"corpus compile failed for {label}/{language}: "
                             f"{result['stdout']} {result['stderr']}")
-                    link_command = ["lld-link", "/dll", "/nodefaultlib", "/debug:none",
-                                    "/incremental:no", "/opt:noref", "/opt:noicf",
-                                    "/entry:bench_entry", f"/out:{binary}", str(object_path)]
-                    if language == "c":
+                    if crt == "none":
+                        link_command = ["lld-link", "/dll", "/nodefaultlib", "/debug:none",
+                                        "/incremental:no", "/opt:noref", "/opt:noicf",
+                                        "/entry:bench_entry", f"/out:{binary}", str(object_path)]
                         kits = pathlib.Path("C:/Program Files (x86)/Windows Kits/10/Lib")
                         kernel = sorted(kits.glob("10.*/um/x64/kernel32.lib"), reverse=True)
                         if not kernel:
                             raise RuntimeError("kernel32.lib unavailable for API-shaped fixture")
-                        link_command.append(str(kernel[0]))
+                        if language == "c":
+                            link_command.append(str(kernel[0]))
+                    else:
+                        link_command = ["clang-cl", "/nologo", "/LD", str(object_path),
+                                        "/link", "/debug:none", "/incremental:no",
+                                        "/opt:noref", "/opt:noicf", f"/out:{binary}",
+                                        f"/implib:{release / f'artifact_{language}.lib'}"]
+                        if language == "c":
+                            link_command.append("kernel32.lib")
                     result = run(link_command, root, 120)
                     commands.append(result)
                     if result["exit"] != 0:
@@ -206,12 +219,13 @@ def build(root: pathlib.Path, config: dict[str, Any], output: pathlib.Path) -> d
                                       "bytes": binary.stat().st_size,
                                       "compiler": compiler,
                                       "optimization": optimization,
+                                      "crt": crt,
                                       "language": language,
                                       "exports": pe_exports(binary)})
                 continue
             configure = ["cmake", "-S", str(corpus_root), "-B", str(directory),
                          "-G", "Visual Studio 17 2022", "-A", "x64",
-                         f"-DBENCH_OPT={optimization}"]
+                         f"-DBENCH_OPT={optimization}", f"-DBENCH_CRT={crt}"]
             result = run(configure, root, 120)
             commands.append(result)
             if result["exit"] != 0:
@@ -228,7 +242,8 @@ def build(root: pathlib.Path, config: dict[str, Any], output: pathlib.Path) -> d
                 artifacts.append({"id": f"{label}-{language}", "path": str(binary.resolve()),
                                   "sha256": sha256_file(binary), "bytes": binary.stat().st_size,
                                   "compiler": compiler, "optimization": optimization,
-                                  "language": language, "exports": pe_exports(binary)})
+                                  "crt": crt, "language": language,
+                                  "exports": pe_exports(binary)})
 
     cases: list[dict[str, Any]] = []
     for artifact in artifacts:
