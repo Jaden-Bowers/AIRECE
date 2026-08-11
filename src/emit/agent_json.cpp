@@ -80,6 +80,7 @@ std::string binary_expression(
     const std::string_view operation,
     const std::string& right) {
     if ((operation == "^" || operation == "-") && left == right) return "0";
+    if (operation == "&" && left == right) return left;
     if ((operation == "+" || operation == "|" || operation == "^") && left == "0") {
         return right;
     }
@@ -294,6 +295,12 @@ struct SwitchFact {
     Fact default_result;
 };
 
+struct PathFact {
+    std::vector<std::string> predicates;
+    std::string result;
+    std::string evidence;
+};
+
 struct Digest {
     std::size_t instruction_count{};
     std::vector<std::uint16_t> parameter_bits;
@@ -301,6 +308,7 @@ struct Digest {
     std::vector<Fact> conditions;
     std::vector<Fact> calls;
     std::vector<Fact> memory;
+    std::vector<PathFact> paths;
     std::set<std::uint64_t> constants;
     std::vector<SwitchFact> switches;
     std::size_t unresolved{};
@@ -312,6 +320,18 @@ void append_unique(std::vector<Fact>& facts, Fact fact) {
             return existing.text == fact.text && existing.evidence == fact.evidence;
         })) {
         facts.push_back(std::move(fact));
+    }
+}
+
+void append_memory_effect(
+    std::vector<Fact>& facts,
+    const std::string& effect,
+    const std::string& evidence) {
+    if (std::none_of(facts.begin(), facts.end(), [&](const Fact& existing) {
+            return existing.evidence == evidence &&
+                (existing.text == effect || existing.text.starts_with(effect + "="));
+        })) {
+        facts.push_back({effect, evidence});
     }
 }
 
@@ -330,6 +350,7 @@ struct NodeResult {
     State state;
     std::string return_expression;
     std::string index_expression;
+    std::string branch_condition;
     std::optional<bool> branch_taken;
 };
 
@@ -337,7 +358,21 @@ struct PathState {
     xair_cfg_node_id node{XAIR_CFG_INVALID_ID};
     State state;
     std::unordered_map<xair_cfg_node_id, std::size_t> visits;
+    std::vector<std::string> predicates;
 };
+
+void annotate_memory(
+    std::vector<Fact>& facts,
+    const std::string_view effect,
+    const std::string& evidence,
+    const std::string& expression) {
+    const auto found = std::find_if(facts.begin(), facts.end(), [&](const Fact& fact) {
+        return fact.text == effect && fact.evidence == evidence;
+    });
+    if (found != facts.end()) {
+        found->text += "=" + expression;
+    }
+}
 
 std::optional<bool> evaluate_condition(
     const std::string& left,
@@ -371,7 +406,7 @@ NodeResult interpret_node(
     const bool switch_header) {
     std::string compare_left;
     std::string compare_right;
-    NodeResult result{std::move(state), {}, {}, std::nullopt};
+    NodeResult result{std::move(state), {}, {}, {}, std::nullopt};
     std::uint64_t address = node.start;
     while (address < node.end) {
         xair_x86_decoded_inst instruction{};
@@ -426,11 +461,11 @@ NodeResult interpret_node(
                 const bool promoted_stack = kind == "stack" && operand.value.mem.has_index == 0;
                 if (!switch_header && !promoted_stack &&
                     (operand.actions & XAIR_X86_ACTION_READ) != 0) {
-                    append_unique(digest.memory, {"read:" + kind, evidence});
+                    append_memory_effect(digest.memory, "read:" + kind, evidence);
                 }
                 if (!switch_header && !promoted_stack &&
                     (operand.actions & XAIR_X86_ACTION_WRITE) != 0) {
-                    append_unique(digest.memory, {"write:" + kind, evidence});
+                    append_memory_effect(digest.memory, "write:" + kind, evidence);
                 }
                 if (operand.value.mem.has_index != 0 && result.index_expression.empty()) {
                     result.index_expression = register_value(result.state, operand.value.mem.index);
@@ -460,6 +495,18 @@ NodeResult interpret_node(
                 }
                 write_register(result.state, instruction.operands[0], value);
                 write_memory(result.state, instruction.operands[0], value, end);
+                if (instruction.operands[0].kind == XAIR_X86_OPERAND_MEMORY) {
+                    const std::string kind = classify_memory(instruction.operands[0].value.mem);
+                    if (kind != "stack") {
+                        annotate_memory(digest.memory, "write:" + kind, evidence, value);
+                    }
+                }
+                if (instruction.operands[1].kind == XAIR_X86_OPERAND_MEMORY) {
+                    const std::string kind = classify_memory(instruction.operands[1].value.mem);
+                    if (kind != "stack") {
+                        annotate_memory(digest.memory, "read:" + kind, evidence, value);
+                    }
+                }
             }
             break;
         case XAIR_X86_MNEMONIC_LEA:
@@ -548,37 +595,44 @@ NodeResult interpret_node(
             }
             break;
         case XAIR_X86_MNEMONIC_CMP:
-        case XAIR_X86_MNEMONIC_TEST:
             if (instruction.visible_operand_count >= 2) {
                 compare_left = operand(0);
                 compare_right = operand(1);
             }
             break;
+        case XAIR_X86_MNEMONIC_TEST:
+            if (instruction.visible_operand_count >= 2) {
+                compare_left = binary_expression(operand(0), "&", operand(1));
+                compare_right = "0";
+            }
+            break;
         case XAIR_X86_MNEMONIC_JCC:
             if (!compare_left.empty()) {
-                append_unique(digest.conditions, {
-                    compare_left + ' ' + condition_token(instruction.condition) + ' ' +
-                        compare_right,
-                    evidence});
+                result.branch_condition = compare_left + ' ' +
+                    condition_token(instruction.condition) + ' ' + compare_right;
+                append_unique(digest.conditions, {result.branch_condition, evidence});
                 result.branch_taken = evaluate_condition(
                     compare_left, compare_right, instruction.condition);
             }
             break;
         case XAIR_X86_MNEMONIC_CALL: {
-            std::string call;
+            std::string target;
             if (instruction.branch_target_valid != 0) {
-                call = "direct:" + hex_value(instruction.branch_target);
+                target = "direct:" + hex_value(instruction.branch_target);
             } else if (instruction.visible_operand_count > 0 &&
                        instruction.operands[0].kind == XAIR_X86_OPERAND_MEMORY &&
                        instruction.operands[0].value.mem.kind == XAIR_X86_MEM_RIP_REL) {
                 const auto displacement = instruction.operands[0].value.mem.displacement;
-                call = "imported:" + hex_value(static_cast<std::uint64_t>(
+                target = "imported:" + hex_value(static_cast<std::uint64_t>(
                     static_cast<std::int64_t>(end) + displacement));
             } else {
-                call = "indirect";
+                target = "indirect";
             }
+            const std::string call = target + "(arg0=" +
+                result.state.registers[XAIR_X86_RCX] + ')';
             append_unique(digest.calls, {call, evidence});
-            result.state.registers[XAIR_X86_RAX] = "result(" + call + ')';
+            result.state.registers[XAIR_X86_RAX] =
+                "result(" + call + " @ " + evidence + ')';
             break;
         }
         default: break;
@@ -599,7 +653,7 @@ NodeResult trace_return(
     const std::unordered_map<xair_cfg_node_id, std::vector<xair_cfg_node_id>>& successors,
     const std::unordered_set<xair_cfg_node_id>& switch_headers) {
     std::unordered_set<xair_cfg_node_id> visited;
-    NodeResult result{std::move(state), {}, {}, std::nullopt};
+    NodeResult result{std::move(state), {}, {}, {}, std::nullopt};
     for (std::size_t step = 0; step < 64 && visited.insert(node_id).second; ++step) {
         const xair_cfg_node* node = xair_cfg_get_node(&session.cfg(), node_id);
         if (node == nullptr) break;
@@ -631,7 +685,7 @@ NodeResult interpret_linear_fallthrough(
     std::uint64_t address,
     State state,
     Digest& digest) {
-    NodeResult result{std::move(state), {}, {}, std::nullopt};
+    NodeResult result{std::move(state), {}, {}, {}, std::nullopt};
     std::unordered_set<std::uint64_t> visited;
     for (std::size_t count = 0; count < 256 && visited.insert(address).second; ++count) {
         xair_x86_decoded_inst instruction{};
@@ -668,6 +722,13 @@ std::string render_digest(
         };
         if (facts_mention(digest.returns) || facts_mention(digest.conditions) ||
             facts_mention(digest.calls) || facts_mention(digest.memory)) return true;
+        if (std::any_of(digest.paths.begin(), digest.paths.end(), [&](const PathFact& item) {
+                if (item.result.find(name) != std::string::npos) return true;
+                return std::any_of(item.predicates.begin(), item.predicates.end(),
+                    [&](const std::string& predicate) {
+                        return predicate.find(name) != std::string::npos;
+                    });
+            })) return true;
         return std::any_of(digest.switches.begin(), digest.switches.end(),
             [&](const SwitchFact& item) {
                 if (item.selector.find(name) != std::string::npos ||
@@ -723,6 +784,18 @@ std::string render_digest(
         out << "],\"default\":{\"result\":"; quoted(out, item.default_result.text);
         out << ",\"evidence\":"; quoted(out, item.default_result.evidence); out << "}}";
     }
+    out << "],\"paths\":[";
+    for (std::size_t index = 0; index < digest.paths.size(); ++index) {
+        if (index != 0) out << ',';
+        out << "{\"when\":[";
+        for (std::size_t predicate = 0;
+             predicate < digest.paths[index].predicates.size(); ++predicate) {
+            if (predicate != 0) out << ',';
+            quoted(out, digest.paths[index].predicates[predicate]);
+        }
+        out << "],\"result\":"; quoted(out, digest.paths[index].result);
+        out << ",\"evidence\":"; quoted(out, digest.paths[index].evidence); out << '}';
+    }
     out << "],\"calls\":[";
     for (std::size_t index = 0; index < digest.calls.size(); ++index) {
         if (index != 0) out << ',';
@@ -732,7 +805,12 @@ std::string render_digest(
     out << "],\"memory_effects\":[";
     for (std::size_t index = 0; index < digest.memory.size(); ++index) {
         if (index != 0) out << ',';
-        out << "{\"effect\":"; quoted(out, digest.memory[index].text);
+        const std::string& text = digest.memory[index].text;
+        const std::size_t separator = text.find('=');
+        out << "{\"effect\":"; quoted(out, text.substr(0, separator));
+        if (separator != std::string::npos) {
+            out << ",\"expression\":"; quoted(out, text.substr(separator + 1));
+        }
         out << ",\"evidence\":"; quoted(out, digest.memory[index].evidence); out << '}';
     }
     out << "],\"constants\":[";
@@ -844,7 +922,7 @@ std::string render_agent_json(
     // intentionally visits a CFG node once; that is useful for a stable digest but
     // would otherwise collapse O0 diamonds onto whichever predecessor arrived first.
     std::deque<PathState> paths;
-    paths.push_back({semantic.control.entry, initial_state(), {}});
+    paths.push_back({semantic.control.entry, initial_state(), {}, {}});
     std::size_t explored_paths = 0;
     while (!paths.empty() && explored_paths < 1024) {
         PathState path = std::move(paths.front());
@@ -860,6 +938,15 @@ std::string render_agent_json(
         if (!result.return_expression.empty()) {
             append_unique(digest.returns, {result.return_expression,
                 evidence_id(node->start, node->end)});
+            if (!path.predicates.empty() && digest.paths.size() < 32 &&
+                std::none_of(digest.paths.begin(), digest.paths.end(),
+                    [&](const PathFact& existing) {
+                        return existing.predicates == path.predicates &&
+                            existing.result == result.return_expression;
+                    })) {
+                digest.paths.push_back({path.predicates, result.return_expression,
+                    evidence_id(node->start, node->end)});
+            }
             continue;
         }
         std::unordered_set<xair_cfg_node_id> queued;
@@ -874,7 +961,16 @@ std::string render_agent_json(
                 continue;
             }
             if (queued.insert(successor).second) {
-                paths.push_back({successor, result.state, path.visits});
+                std::vector<std::string> predicates = path.predicates;
+                if (!result.branch_condition.empty()) {
+                    if (kind == ControlTransferKind::branch_true) {
+                        predicates.push_back(result.branch_condition);
+                    } else if (kind == ControlTransferKind::branch_false) {
+                        predicates.push_back("not(" + result.branch_condition + ')');
+                    }
+                }
+                paths.push_back({successor, result.state, path.visits,
+                                 std::move(predicates)});
             }
         }
     }
@@ -932,7 +1028,7 @@ std::string render_agent_json(
             return true;
         };
         removed = trim(digest.memory) || trim(digest.conditions) || trim(digest.calls) ||
-            trim(digest.returns);
+            trim(digest.paths) || trim(digest.returns);
         if (!removed && !digest.constants.empty()) {
             digest.constants.erase(std::prev(digest.constants.end()));
             ++digest.omitted;

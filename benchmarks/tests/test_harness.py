@@ -13,7 +13,8 @@ from benchmarks.airece_bench.prompts import (extract_sections, instructions,
                                              validate_isolation)
 from benchmarks.airece_bench.lmstudio import LMStudioAdapter
 from benchmarks.airece_bench.runner import (_assert_semantic_context, _records,
-                                             _select_cases, _validate_direct_final,
+                                             _normalize_direct_final, _select_cases,
+                                             _validate_direct_final,
                                              rebuild_jsonl)
 from benchmarks.airece_bench.scoring import (extract_c_function, extract_json,
                                              score_objective, summarize,
@@ -124,6 +125,10 @@ class ParserScoringTests(unittest.TestCase):
         self.assertEqual(_validate_direct_final("reconstruction", function), [])
         self.assertTrue(_validate_direct_final("reconstruction", "```c\n" + function + "\n```"))
         self.assertTrue(_validate_direct_final("objective", "```json\n{}\n```"))
+        self.assertEqual(_normalize_direct_final(
+            "reconstruction", "```c\n" + function + "\n```"), function)
+        wrapped = json.dumps({"analysis": {"code": function}})
+        self.assertEqual(_normalize_direct_final("reconstruction", wrapped), function)
 
 
 class CorpusTests(unittest.TestCase):
@@ -165,15 +170,18 @@ class CorpusTests(unittest.TestCase):
             "loop-and-array": {"returns": [{"expression": "arg0 + arg1 * 4"}],
                 "constants": ["0x4"]},
             "nested-branches": {"returns": [{"expression": "a"}, {"expression": "b"}],
-                "conditions": [{"expression": "a"}, {"expression": "b"}]},
-            "direct-calls": {"calls": [{"kind_target": "direct:0x1"},
-                                          {"kind_target": "direct:0x2"}]},
+                "conditions": [{"expression": "a"}, {"expression": "b"}],
+                "paths": [{"when": ["a"], "result": "a"},
+                           {"when": ["not(a)"], "result": "b"}]},
+            "direct-calls": {"calls": [{"kind_target": "direct:0x1(arg0=arg0)"},
+                                          {"kind_target": "direct:0x1(arg0=arg1)"}],
+                "returns": [{"expression": "result(direct:0x1) ^ result(direct:0x1)"}]},
             "recursion": {"calls": [{"kind_target": "direct:0x1"}]},
             "api-source-sink-flow": {"calls": [{"kind_target": "imported:0x1"},
                                                    {"kind_target": "imported:0x2"}],
                 "memory_effects": [{"effect": "read:api-mediated"}]},
             "global-read-write": {"memory_effects": [{"effect": "read:global"},
-                                                        {"effect": "write:global"}]},
+                {"effect": "write:global", "expression": "arg0 ^ arg1"}]},
             "structure-access": {"returns": [{"expression": "arg0 + arg1"}],
                 "constants": ["0x9", "0x1234"]},
             "indirect-call": {"calls": [{"kind_target": "indirect"}]},

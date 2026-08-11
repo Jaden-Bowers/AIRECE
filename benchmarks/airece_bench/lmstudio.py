@@ -147,7 +147,8 @@ class LMStudioAdapter:
     def run_direct_final(self, instructions: str, user_input: str, evidence: str,
                          validator: Callable[[str], list[str]],
                          max_input_bytes: int = 120000,
-                         final_schema: dict[str, Any] | None = None) -> dict[str, Any]:
+                         final_schema: dict[str, Any] | None = None,
+                         normalizer: Callable[[str], str] | None = None) -> dict[str, Any]:
         """Generate a final answer from one deterministic context, with one repair."""
         if self.base_url is None:
             self.probe()
@@ -159,26 +160,31 @@ class LMStudioAdapter:
         total_model_ms = 0.0
         raw_final = ""
         final = ""
+        raw_validation_errors: list[str] = []
         validation_errors: list[str] = []
+        normalizations: list[dict[str, Any]] = []
         headers: dict[str, Any] = {}
         for attempt in range(2):
-            direct_instructions = instructions + """
+            if attempt == 0:
+                direct_instructions = instructions + """
 
 Tools are unavailable. Use only the supplied target context and produce the exact final
 answer requested by the task. Do not emit a tool-protocol wrapper, commentary, or markdown
 fence.
 """
-            if final_schema is not None:
-                direct_instructions += "\nRequired final JSON schema:\n" + \
-                    canonical_json(final_schema) + "\n"
-            envelope: dict[str, Any] = {"task": user_input, "target_context": evidence}
-            if attempt:
+                if final_schema is not None:
+                    direct_instructions += "\nRequired final JSON schema:\n" + \
+                        canonical_json(final_schema) + "\n"
+                envelope: dict[str, Any] = {"task": user_input, "target_context": evidence}
+            else:
+                direct_instructions = """You are a deterministic output-format repair step.
+Return only the artifact required by the task. Do not add analysis, JSON wrappers, markdown
+fences, or commentary. Preserve the previous answer's intended semantics; only correct the
+reported structural problems.\n"""
+                envelope = {"task": user_input}
                 envelope["invalid_previous_answer"] = raw_final
+                envelope["normalized_previous_answer"] = final
                 envelope["validation_errors"] = validation_errors
-                direct_instructions += """
-The previous answer failed structural validation. Correct only the reported structural
-problems while preserving its intended semantics. Return the complete corrected answer.
-"""
             payload: dict[str, Any] = {"model": self.config["id"],
                 "instructions": direct_instructions, "input": canonical_json(envelope),
                 "temperature": self.config["temperature"], "seed": self.config["seed"],
@@ -209,16 +215,23 @@ problems while preserving its intended semantics. Return the complete corrected 
                 (current.get("input_tokens_details") or {}).get("cached_tokens") or 0)
             if response.get("status") not in {"completed", "incomplete"}:
                 raise LMStudioError(f"direct-final response failed: {response.get('error')}")
-            final = self._text(response)
+            response_text = self._text(response)
             if attempt == 0:
-                raw_final = final
+                raw_final = response_text
+                raw_validation_errors = validator(raw_final)
+            final = normalizer(response_text) if normalizer is not None else response_text
+            if final != response_text:
+                normalizations.append({"attempt": attempt + 1,
+                    "input_size": text_size(response_text), "output_size": text_size(final)})
             validation_errors = validator(final)
             if not validation_errors:
                 break
+        repair_attempted = bool(normalizations) or len(requests) > 1
         return {"transport": "deterministic-context", "final_text": final,
-            "raw_final_text": raw_final, "repair_attempted": bool(validation_errors) or
-                len(requests) > 1,
-            "repair_succeeded": len(requests) > 1 and not validation_errors,
+            "raw_final_text": raw_final, "raw_validation_errors": raw_validation_errors,
+            "normalizations": normalizations, "model_repair_attempted": len(requests) > 1,
+            "repair_attempted": repair_attempted,
+            "repair_succeeded": repair_attempted and not validation_errors,
             "final_validation_errors": validation_errors,
             "usage": usage, "requests": requests, "responses": responses,
             "tool_events": [], "protocol_errors": [], "protocol_recoveries": [],

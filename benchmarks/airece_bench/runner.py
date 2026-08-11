@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pathlib
 import random
+import re
 import time
 from typing import Any
 
@@ -88,6 +89,51 @@ def _validate_direct_final(task: str, text: str) -> list[str]:
     return []
 
 
+def _normalize_direct_final(task: str, text: str) -> str:
+    """Remove only recoverable presentation wrappers; never invent semantics."""
+    candidate = text.strip()
+    fenced = re.fullmatch(r"```(?:json|c)?\s*\n?(.*?)\n?```", candidate,
+                          flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    if task == "objective":
+        return candidate
+    if candidate.startswith("uint32_t target"):
+        function, error = extract_c_function(candidate)
+        if error is None and function is not None:
+            return function.strip()
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return candidate
+    recovered: list[str] = []
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            variants = [value]
+            if "\\n" in value or "\\r" in value or "\\t" in value:
+                variants.append(value.replace("\\r\\n", "\n").replace("\\n", "\n")
+                                .replace("\\r", "\n").replace("\\t", "\t"))
+            for variant in variants:
+                found, found_error = extract_c_function(variant)
+                if found_error is None and found is not None:
+                    recovered.append(found.strip())
+        elif isinstance(value, dict):
+            signature, body = value.get("signature"), value.get("body")
+            if (isinstance(signature, str) and isinstance(body, str) and
+                    signature.strip() == "uint32_t target(uint32_t a, uint32_t b)"):
+                found, found_error = extract_c_function(signature.strip() + " { " +
+                                                        body.strip() + " }")
+                if found_error is None and found is not None:
+                    recovered.append(found.strip())
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+    visit(parsed)
+    return min(recovered, key=len) if recovered else candidate
+
+
 def _assert_semantic_context(category: str | None, context: dict[str, Any]) -> bool:
     """Enforce one deterministic agent-view contract for every fixture family."""
     if context.get("function", {}).get("parameter_count") != 2:
@@ -123,11 +169,17 @@ def _assert_semantic_context(category: str | None, context: dict[str, Any]) -> b
                    ("* 4" in item or "4 *" in item) for item in returns):
             raise AssertionError("loop agent context lacks the recovered aggregate expression")
     elif category == "nested-branches":
-        if len(conditions) < 2 or len(returns) < 2:
-            raise AssertionError("nested-branch agent context lacks conditions or results")
+        paths = context.get("paths", [])
+        if (len(conditions) < 2 or len(returns) < 2 or len(paths) < 2 or
+                any(not item.get("when") or not item.get("result") for item in paths)):
+            raise AssertionError("nested-branch context lacks linked conditions and results")
     elif category == "direct-calls":
-        if len([item for item in calls if item.startswith("direct:")]) < 2:
-            raise AssertionError("direct-call agent context lacks both call sites")
+        joined_returns = " | ".join(returns)
+        if (len([item for item in calls if item.startswith("direct:")]) < 2 or
+                not any("arg0=arg0" in item for item in calls) or
+                not any("arg0=arg1" in item for item in calls) or
+                joined_returns.count("result(direct:") < 2):
+            raise AssertionError("direct-call context lacks distinct arguments or results")
     elif category == "recursion":
         if not any(item.startswith("direct:") for item in calls):
             raise AssertionError("recursion agent context contains no recursive call fact")
@@ -138,12 +190,17 @@ def _assert_semantic_context(category: str | None, context: dict[str, Any]) -> b
     elif category == "global-read-write":
         if not {"read:global", "write:global"}.issubset(effects):
             raise AssertionError("global-memory agent context lacks read/write effects")
+        writes = [str(item.get("expression", ""))
+                  for item in context.get("memory_effects", [])
+                  if item.get("effect") == "write:global"]
+        if not any("arg0" in item and "arg1" in item for item in writes):
+            raise AssertionError("global-memory context lacks the written value expression")
     elif category == "structure-access":
         if (not any("arg0" in item and "arg1" in item for item in returns) or
                 not {"0x9", "0x1234"}.issubset(constants)):
             raise AssertionError("structure-access context lacks field expression or constants")
     elif category == "indirect-call":
-        if "indirect" not in calls:
+        if not any(item.startswith("indirect(") or item == "indirect" for item in calls):
             raise AssertionError("indirect-call agent context lacks an indirect call fact")
     else:
         return False
@@ -428,7 +485,8 @@ class BenchmarkRunner:
                     model = lm.run_direct_final(
                         visible, task_prompt, context, validate_final,
                         self.config["budgets"]["max_input_bytes"],
-                        OBJECTIVE_SCHEMA if job["task"] == "objective" else None)
+                        OBJECTIVE_SCHEMA if job["task"] == "objective" else None,
+                        lambda text: _normalize_direct_final(job["task"], text))
                     model["tool_events"] = [context_event]
                 elif self.config["model"].get("tool_transport") == "json-protocol":
                     model = lm.run_json_protocol(visible, task_prompt, schemas,
