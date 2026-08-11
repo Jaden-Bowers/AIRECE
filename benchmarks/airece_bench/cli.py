@@ -14,6 +14,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-cases", type=int, default=2)
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--split", choices=("development", "heldout"), default="heldout")
+    parser.add_argument("--track", action="append", choices=("common", "native"),
+                        help="Run only the selected track; may be repeated")
+    parser.add_argument("--output-root",
+                        help="Override paths.output_root without editing the config")
     parser.add_argument("--no-rebuild-corpus", action="store_true")
     parser.add_argument("--task-timeout-seconds", type=float)
     parser.add_argument("--analyzer-timeout-seconds", type=float)
@@ -26,6 +30,11 @@ def main(argv: list[str] | None = None) -> int:
         ("task_timeout_seconds", "analyzer_timeout_seconds", "ghidra_timeout_seconds",
          "compile_timeout_seconds", "execute_timeout_seconds")}
     runner = BenchmarkRunner(root, (root / arguments.config).resolve(), overrides)
+    if arguments.track:
+        runner.config["tracks"] = arguments.track
+    if arguments.output_root:
+        runner.config["paths"]["output_root"] = arguments.output_root
+        runner.output = (root / arguments.output_root).resolve()
     result = runner.execute(arguments.max_cases, arguments.repetitions,
                             arguments.dry_run, arguments.split,
                             not arguments.no_rebuild_corpus)
