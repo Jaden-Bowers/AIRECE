@@ -12,7 +12,9 @@ from benchmarks.airece_bench.corpus import (FUNCTIONS, TEST_INPUTS, dense, direc
 from benchmarks.airece_bench.prompts import (extract_sections, instructions,
                                              validate_isolation)
 from benchmarks.airece_bench.lmstudio import LMStudioAdapter
-from benchmarks.airece_bench.runner import _records, rebuild_jsonl
+from benchmarks.airece_bench.runner import (_assert_semantic_context, _records,
+                                             _select_cases, _validate_direct_final,
+                                             rebuild_jsonl)
 from benchmarks.airece_bench.scoring import (extract_c_function, extract_json,
                                              score_objective, summarize,
                                              validate_objective)
@@ -117,6 +119,12 @@ class ParserScoringTests(unittest.TestCase):
         self.assertIsNone(function)
         self.assertIn("forbidden", error)
 
+    def test_direct_final_validation_rejects_recoverable_wrappers(self) -> None:
+        function = "uint32_t target(uint32_t a, uint32_t b) { return a + b; }"
+        self.assertEqual(_validate_direct_final("reconstruction", function), [])
+        self.assertTrue(_validate_direct_final("reconstruction", "```c\n" + function + "\n```"))
+        self.assertTrue(_validate_direct_final("objective", "```json\n{}\n```"))
+
 
 class CorpusTests(unittest.TestCase):
     def test_oracles_are_bounded_and_deterministic(self) -> None:
@@ -127,6 +135,54 @@ class CorpusTests(unittest.TestCase):
             second = [function(a, b) for a, b in TEST_INPUTS]
             self.assertEqual(first, second)
             self.assertTrue(all(0 <= value <= 0xffffffff for value in first))
+
+    def test_category_selection_is_deterministic(self) -> None:
+        cases = [
+            {"case_id": "slow", "artifact_id": "clangcl-o0-static-cpp",
+             "truth": {"category": "dense-switch"}},
+            {"case_id": "preferred", "artifact_id": "msvc-o2-none-cpp",
+             "truth": {"category": "dense-switch"}},
+            {"case_id": "global", "artifact_id": "msvc-o2-none-cpp",
+             "truth": {"category": "global-read-write"}},
+        ]
+        config = {"selection_categories": ["dense-switch", "global-read-write"],
+                  "corpus": {"seed": 1}}
+        self.assertEqual([item["case_id"] for item in _select_cases(cases, config, 5)],
+                         ["preferred", "global"])
+
+    def test_semantic_contract_covers_every_category(self) -> None:
+        dense_results = ["arg1 + 0xb", "arg1 * 3", "arg1 - 0x13",
+                         "arg1 ^ 0x55", "arg1 + 0x65", "arg1 - 7"]
+        contexts = {
+            "dense-switch": {"switches": [{"selector": "arg0 & 7",
+                "cases": [{"value": index, "result": result}
+                          for index, result in enumerate(dense_results)],
+                "default": {"result": "arg1 ^ 0x313"}}]},
+            "bit-manipulation": {"returns": [{"expression": "arg0 ^ arg1"}],
+                "constants": ["0x1f", "0xa5a5a5a5"]},
+            "sparse-switch": {"returns": [{"expression": str(index)} for index in range(4)],
+                "conditions": [{"expression": "arg0 == 3 | arg0 == 9 | arg0 == 0x11"}]},
+            "loop-and-array": {"returns": [{"expression": "arg0 + arg1 * 4"}],
+                "constants": ["0x4"]},
+            "nested-branches": {"returns": [{"expression": "a"}, {"expression": "b"}],
+                "conditions": [{"expression": "a"}, {"expression": "b"}]},
+            "direct-calls": {"calls": [{"kind_target": "direct:0x1"},
+                                          {"kind_target": "direct:0x2"}]},
+            "recursion": {"calls": [{"kind_target": "direct:0x1"}]},
+            "api-source-sink-flow": {"calls": [{"kind_target": "imported:0x1"},
+                                                   {"kind_target": "imported:0x2"}],
+                "memory_effects": [{"effect": "read:api-mediated"}]},
+            "global-read-write": {"memory_effects": [{"effect": "read:global"},
+                                                        {"effect": "write:global"}]},
+            "structure-access": {"returns": [{"expression": "arg0 + arg1"}],
+                "constants": ["0x9", "0x1234"]},
+            "indirect-call": {"calls": [{"kind_target": "indirect"}]},
+        }
+        self.assertEqual(set(contexts), {item["category"] for item in FUNCTIONS.values()})
+        for context in contexts.values():
+            context["function"] = {"parameter_count": 2}
+        self.assertTrue(all(_assert_semantic_context(category, context)
+                            for category, context in contexts.items()))
 
 
 class ResumeTests(unittest.TestCase):
@@ -163,6 +219,30 @@ class ResumeTests(unittest.TestCase):
 
 
 class ToolBudgetTests(unittest.TestCase):
+    def test_direct_final_records_and_repairs_invalid_structure(self) -> None:
+        adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
+            "responses_path": "/v1/responses", "native_chat_path": "/api/v1/chat",
+            "temperature": 0, "seed": 1, "max_output_tokens": 32}, 10)
+        adapter.base_url = "http://unused"
+        responses = iter([
+            {"id": "one", "status": "completed", "usage": {}, "output": [{
+                "type": "message", "content": [{"type": "output_text",
+                    "text": '{"wrong":true}'}]}]},
+            {"id": "two", "status": "completed", "usage": {}, "output": [{
+                "type": "message", "content": [{"type": "output_text",
+                    "text": '{"ok":true}'}]}]},
+        ])
+        adapter._request = lambda *args, **kwargs: (next(responses), {}, 1.0)  # type: ignore[method-assign]
+        result = adapter.run_direct_final(
+            "instructions", "input", '{"context":true}',
+            lambda text: [] if json.loads(text) == {"ok": True} else ["wrong fields"],
+            10000, {"type": "object"})
+        self.assertEqual(result["raw_final_text"], '{"wrong":true}')
+        self.assertEqual(result["final_text"], '{"ok":true}')
+        self.assertTrue(result["repair_attempted"])
+        self.assertTrue(result["repair_succeeded"])
+        self.assertIn("validation_errors", json.loads(result["requests"][1]["input"]))
+
     def test_exhausted_budget_forces_final_turn(self) -> None:
         adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
             "responses_path": "/v1/responses", "native_chat_path": "/api/v1/chat",

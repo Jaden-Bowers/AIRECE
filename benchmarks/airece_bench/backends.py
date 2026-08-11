@@ -133,7 +133,7 @@ class AireceBackend(Backend):
         elif name == "fn":
             view = arguments.get("view") or ("agent" if arguments.get("level") == "primary" else "ir")
             command += ["fn", str(self.binary), str(arguments["address"]), "--view", view,
-                        "--profile", "balanced", "--max-bytes", str(self.max_bytes),
+                        "--profile", "fast", "--max-bytes", str(self.max_bytes),
                         "--max-statements", "256", "--max-evidence", "256"]
         elif name in {"calls", "xrefs"}:
             command += [name, str(self.binary), str(arguments["address"])]

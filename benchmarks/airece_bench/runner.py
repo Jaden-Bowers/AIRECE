@@ -11,7 +11,8 @@ from .corpus import build as build_corpus
 from .lmstudio import LMStudioAdapter
 from .prompts import (OBJECTIVE_SCHEMA, extract_sections, instructions, objective_prompt,
                       prompt_snapshot, reconstruction_prompt, validate_isolation)
-from .scoring import score_objective, score_reconstruction, summarize
+from .scoring import (extract_c_function, score_objective,
+                      score_reconstruction, summarize, validate_objective)
 from .util import (atomic_write_json, atomic_write_text, canonical_json, load_json,
                    resolve, run, sha256_bytes, sha256_file)
 
@@ -42,6 +43,27 @@ def rebuild_jsonl(output: pathlib.Path, records: list[dict[str, Any]]) -> None:
         canonical_json(record) + "\n" for record in sorted(records, key=lambda item: item["run_id"])))
 
 
+def _select_cases(cases: list[dict[str, Any]], config: dict[str, Any],
+                  max_cases: int) -> list[dict[str, Any]]:
+    categories = config.get("selection_categories") or []
+    if categories:
+        selected: list[dict[str, Any]] = []
+        for category in categories:
+            candidates = [item for item in cases
+                          if item.get("truth", {}).get("category") == category]
+            if not candidates:
+                raise ValueError(f"no case in selected split for category: {category}")
+            candidates.sort(key=lambda item: (
+                0 if item.get("artifact_id") == "msvc-o2-none-cpp" else
+                1 if str(item.get("artifact_id", "")).startswith("msvc-o2-none") else 2,
+                str(item.get("artifact_id", "")), item["case_id"]))
+            selected.append(candidates[0])
+        return selected[:max_cases] if max_cases > 0 else selected
+    shuffled = list(cases)
+    random.Random(config["corpus"]["seed"]).shuffle(shuffled)
+    return shuffled[:max_cases] if max_cases > 0 else shuffled
+
+
 def _function_bounds(document: dict[str, Any], address: str) -> tuple[int, int]:
     wanted = int(address, 0)
     for function in document["functions"]:
@@ -50,13 +72,89 @@ def _function_bounds(document: dict[str, Any], address: str) -> tuple[int, int]:
     return wanted, wanted
 
 
+def _validate_direct_final(task: str, text: str) -> list[str]:
+    """Require a raw schema object or a raw C function, without wrappers."""
+    if task == "objective":
+        try:
+            value = json.loads(text.strip())
+        except json.JSONDecodeError as error:
+            return [f"final answer is not raw JSON: {error.msg}"]
+        return validate_objective(value)
+    function, error = extract_c_function(text)
+    if error is not None or function is None:
+        return [error or "invalid C function"]
+    if text.strip() != function.strip():
+        return ["final answer must contain exactly one raw C function and no wrapper"]
+    return []
+
+
+def _assert_semantic_context(category: str | None, context: dict[str, Any]) -> bool:
+    """Enforce one deterministic agent-view contract for every fixture family."""
+    if context.get("function", {}).get("parameter_count") != 2:
+        raise AssertionError("agent context did not recover both fixture parameters")
+    returns = [str(item.get("expression", "")) for item in context.get("returns", [])]
+    conditions = [str(item.get("expression", "")) for item in context.get("conditions", [])]
+    calls = [str(item.get("kind_target", "")) for item in context.get("calls", [])]
+    effects = {str(item.get("effect", "")) for item in context.get("memory_effects", [])}
+    constants = {str(item).lower() for item in context.get("constants", [])}
+    if category == "dense-switch":
+        dense_results = ["arg1 + 0xb", "arg1 * 3", "arg1 - 0x13",
+                         "arg1 ^ 0x55", "arg1 + 0x65", "arg1 - 7"]
+        switches = context.get("switches", [])
+        if (len(switches) != 1 or switches[0].get("selector") != "arg0 & 7" or
+                [item.get("value") for item in switches[0].get("cases", [])] != list(range(6)) or
+                [item.get("result") for item in switches[0].get("cases", [])] != dense_results or
+                switches[0].get("default", {}).get("result") != "arg1 ^ 0x313"):
+            raise AssertionError("dense-switch agent semantics are incomplete")
+    elif category == "bit-manipulation":
+        joined = " | ".join(returns)
+        if ("arg0" not in joined or "arg1" not in joined or
+                "0xa5a5a5a5" not in constants or
+                ("0x1f" not in constants and "rol(" not in joined)):
+            raise AssertionError("bit-manipulation agent context lacks argument flow or constants")
+    elif category == "sparse-switch":
+        joined = " | ".join(conditions)
+        case_constants = {"0x3", "0x9", "0x11"}
+        if (len(returns) < 4 or not (case_constants.issubset(constants) or
+                all(value in joined for value in ("3", "9", "0x11")))):
+            raise AssertionError("sparse-switch agent context lacks cases or results")
+    elif category == "loop-and-array":
+        if not any("arg0" in item and "arg1" in item and
+                   ("* 4" in item or "4 *" in item) for item in returns):
+            raise AssertionError("loop agent context lacks the recovered aggregate expression")
+    elif category == "nested-branches":
+        if len(conditions) < 2 or len(returns) < 2:
+            raise AssertionError("nested-branch agent context lacks conditions or results")
+    elif category == "direct-calls":
+        if len([item for item in calls if item.startswith("direct:")]) < 2:
+            raise AssertionError("direct-call agent context lacks both call sites")
+    elif category == "recursion":
+        if not any(item.startswith("direct:") for item in calls):
+            raise AssertionError("recursion agent context contains no recursive call fact")
+    elif category == "api-source-sink-flow":
+        if (len([item for item in calls if item.startswith("imported:")]) < 2 or
+                "read:api-mediated" not in effects):
+            raise AssertionError("API flow context lacks imported calls or API-mediated effects")
+    elif category == "global-read-write":
+        if not {"read:global", "write:global"}.issubset(effects):
+            raise AssertionError("global-memory agent context lacks read/write effects")
+    elif category == "structure-access":
+        if (not any("arg0" in item and "arg1" in item for item in returns) or
+                not {"0x9", "0x1234"}.issubset(constants)):
+            raise AssertionError("structure-access context lacks field expression or constants")
+    elif category == "indirect-call":
+        if "indirect" not in calls:
+            raise AssertionError("indirect-call agent context lacks an indirect call fact")
+    else:
+        return False
+    return True
+
+
 def _preflight_targets(airece: pathlib.Path, cases: list[dict[str, Any]],
                        ghidra: GhidraExtractor, max_bytes: int,
                        analyzer_timeout: float) -> list[dict[str, Any]]:
     report: list[dict[str, Any]] = []
     failures: list[str] = []
-    dense_results = ["arg1 + 0xb", "arg1 * 3", "arg1 - 0x13",
-                     "arg1 ^ 0x55", "arg1 + 0x65", "arg1 - 7"]
     for case in cases:
         binary = pathlib.Path(case["binary"])
         wanted = int(case["target_address"], 0)
@@ -78,29 +176,10 @@ def _preflight_targets(airece: pathlib.Path, cases: list[dict[str, Any]],
             if envelope.get("omitted") or context.get("omitted", {}).get("facts"):
                 raise AssertionError("AIRECE agent context was truncated")
             category = case.get("truth", {}).get("category")
-            if category == "dense-switch":
-                switches = context.get("switches", [])
-                if (len(switches) != 1 or switches[0].get("selector") != "arg0 & 7" or
-                        [item.get("value") for item in switches[0].get("cases", [])] != list(range(6)) or
-                        [item.get("result") for item in switches[0].get("cases", [])] != dense_results or
-                        switches[0].get("default", {}).get("result") != "arg1 ^ 0x313"):
-                    raise AssertionError("dense-switch agent semantics are incomplete")
-            elif category == "recursion" and not context.get("calls"):
-                raise AssertionError("recursion agent context contains no call fact")
-            elif category == "nested-branches" and (
-                    len(context.get("conditions", [])) < 2 or
-                    len(context.get("returns", [])) < 2):
-                raise AssertionError("nested-branch agent context lacks conditions or results")
-            elif category == "direct-calls" and len(context.get("calls", [])) < 2:
-                raise AssertionError("direct-call agent context lacks both call sites")
-            elif category == "global-read-write":
-                effects = {item.get("effect") for item in context.get("memory_effects", [])}
-                if not {"read:global", "write:global"}.issubset(effects):
-                    raise AssertionError("global-memory agent context lacks read/write effects")
+            semantic_check = _assert_semantic_context(category, context)
             row["airece"] = {"available": True, "bytes": len(raw.encode("utf-8")),
                              "instructions": context["function"]["instruction_count"],
-                             "semantic_check": category in {"dense-switch", "recursion",
-                                 "nested-branches", "direct-calls", "global-read-write"}}
+                             "semantic_check": semantic_check}
 
             ghidra_backend = GhidraBackend(ghidra, binary, max_bytes)
             raw = ghidra_backend.execute("function_context", {
@@ -143,10 +222,12 @@ def _report(summary: dict[str, Any], manifest: dict[str, Any]) -> str:
         if key.endswith("objective"):
             result = (f"fields {group.get('fields_correct', 0)}/{group.get('fields_total', 0)}; "
                       f"evidence {group.get('evidence_valid', 0)}/{group.get('evidence_total', 0)}; "
+                      f"structure {group.get('final_structure_valid', 0)}/{group['runs']}; "
                       f"unsupported {group.get('unsupported_claims', 0)}/{group.get('claims', 0)}")
         else:
             result = (f"compile {group.get('compiled', 0)}/{group['runs']}; tests "
-                      f"{group.get('tests_passed', 0)}/{group.get('tests_total', 0)}")
+                      f"{group.get('tests_passed', 0)}/{group.get('tests_total', 0)}; "
+                      f"structure {group.get('final_structure_valid', 0)}/{group['runs']}")
         lines.append(f"| {key} | {group['runs']} | {result} | "
                      f"{group['input_tokens']}/{group['output_tokens']} | {group['tool_calls']} |")
     lines += ["", "## Paired differences (AIRECE minus Ghidra)", ""]
@@ -202,9 +283,9 @@ class BenchmarkRunner:
             load_json(self.output / "corpus" / "manifest.json")
         if split not in {"development", "heldout"}:
             raise ValueError(f"unsupported corpus split: {split}")
-        cases = [item for item in corpus_manifest["cases"] if item["split"] == split]
-        random.Random(self.config["corpus"]["seed"]).shuffle(cases)
-        cases = cases[:max_cases] if max_cases > 0 else cases
+        cases = _select_cases(
+            [item for item in corpus_manifest["cases"] if item["split"] == split],
+            self.config, max_cases)
         ghidra = GhidraExtractor(resolve(self.root, self.config["paths"]["ghidra_root"]),
             self.root / "benchmarks" / "ghidra" / "AireceBenchmarkExport.java",
             self.output / "cache" / "ghidra", self.config["budgets"]["ghidra_timeout_seconds"])
@@ -272,11 +353,11 @@ class BenchmarkRunner:
                 rebuild_corpus: bool = True) -> dict[str, Any]:
         if dry_run:
             corpus_path = self.output / "corpus" / "manifest.json"
-            corpus = load_json(corpus_path) if corpus_path.is_file() else \
-                build_corpus(self.root, self.config, self.output)
-            cases = [item for item in corpus["cases"] if item["split"] == split]
-            random.Random(self.config["corpus"]["seed"]).shuffle(cases)
-            cases = cases[:max_cases] if max_cases > 0 else cases
+            corpus = build_corpus(self.root, self.config, self.output) if rebuild_corpus else \
+                load_json(corpus_path)
+            cases = _select_cases(
+                [item for item in corpus["cases"] if item["split"] == split],
+                self.config, max_cases)
             plan = self.plan(cases, repetitions)
             return {"dry_run": True, "jobs": len(plan),
                     "order": [{key: item[key] for key in ("case_id", "repetition", "track",
@@ -334,7 +415,21 @@ class BenchmarkRunner:
                 record["ghidra_extraction"] = extraction
                 def execute_tool(name: str, arguments: dict[str, Any]) -> str:
                     return backend.execute(name, arguments, job["track"])
-                if self.config["model"].get("tool_transport") == "json-protocol":
+                if job["track"] == "common":
+                    context = execute_tool("function_context", {
+                        "address": case["target_address"], "level": "primary"})
+                    context_event = {"name": "function_context", "arguments": {
+                        "address": case["target_address"], "level": "primary"},
+                        "executed": True, "result": context,
+                        "result_size": {"utf8_bytes": len(context.encode("utf-8"))}}
+                    def validate_final(text: str) -> list[str]:
+                        return _validate_direct_final(job["task"], text)
+                    model = lm.run_direct_final(
+                        visible, task_prompt, context, validate_final,
+                        self.config["budgets"]["max_input_bytes"],
+                        OBJECTIVE_SCHEMA if job["task"] == "objective" else None)
+                    model["tool_events"] = [context_event]
+                elif self.config["model"].get("tool_transport") == "json-protocol":
                     model = lm.run_json_protocol(visible, task_prompt, schemas,
                         execute_tool, self.config["budgets"]["max_tool_calls"],
                         self.config["budgets"]["max_input_bytes"],
@@ -345,9 +440,17 @@ class BenchmarkRunner:
                         self.config["budgets"]["max_input_bytes"])
                 record["model"] = model
                 if job["task"] == "objective":
+                    record["raw_score"] = score_objective(
+                        model.get("raw_final_text", model["final_text"]), case["truth"],
+                        model["tool_events"], *bounds)
                     record["score"] = score_objective(model["final_text"], case["truth"],
                                                        model["tool_events"], *bounds)
                 else:
+                    record["raw_score"] = score_reconstruction(
+                        model.get("raw_final_text", model["final_text"]), case["tests"],
+                        "clang-cl", "lld-link",
+                        self.config["budgets"]["compile_timeout_seconds"],
+                        self.config["budgets"]["execute_timeout_seconds"])
                     record["score"] = score_reconstruction(model["final_text"], case["tests"],
                         "clang-cl", "lld-link",
                         self.config["budgets"]["compile_timeout_seconds"],

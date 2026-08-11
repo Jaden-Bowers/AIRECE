@@ -144,6 +144,91 @@ class LMStudioAdapter:
                     parts.append(content.get("text", ""))
         return "".join(parts).strip()
 
+    def run_direct_final(self, instructions: str, user_input: str, evidence: str,
+                         validator: Callable[[str], list[str]],
+                         max_input_bytes: int = 120000,
+                         final_schema: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Generate a final answer from one deterministic context, with one repair."""
+        if self.base_url is None:
+            self.probe()
+        requests: list[dict[str, Any]] = []
+        responses: list[dict[str, Any]] = []
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                 "reasoning_tokens": 0, "cached_tokens": 0}
+        started = time.perf_counter()
+        total_model_ms = 0.0
+        raw_final = ""
+        final = ""
+        validation_errors: list[str] = []
+        headers: dict[str, Any] = {}
+        for attempt in range(2):
+            direct_instructions = instructions + """
+
+Tools are unavailable. Use only the supplied target context and produce the exact final
+answer requested by the task. Do not emit a tool-protocol wrapper, commentary, or markdown
+fence.
+"""
+            if final_schema is not None:
+                direct_instructions += "\nRequired final JSON schema:\n" + \
+                    canonical_json(final_schema) + "\n"
+            envelope: dict[str, Any] = {"task": user_input, "target_context": evidence}
+            if attempt:
+                envelope["invalid_previous_answer"] = raw_final
+                envelope["validation_errors"] = validation_errors
+                direct_instructions += """
+The previous answer failed structural validation. Correct only the reported structural
+problems while preserving its intended semantics. Return the complete corrected answer.
+"""
+            payload: dict[str, Any] = {"model": self.config["id"],
+                "instructions": direct_instructions, "input": canonical_json(envelope),
+                "temperature": self.config["temperature"], "seed": self.config["seed"],
+                "max_output_tokens": self.config["max_output_tokens"], "store": False}
+            if self.config.get("reasoning") is not None:
+                payload["reasoning"] = self.config["reasoning"]
+            payload_bytes = len(canonical_json(payload).encode("utf-8"))
+            if payload_bytes > max_input_bytes:
+                raise LMStudioError(
+                    f"direct-final envelope exceeds input byte budget: {payload_bytes}>{max_input_bytes}")
+            remaining = self.timeout - (time.perf_counter() - started)
+            if remaining <= 0:
+                raise LMStudioError("task wall-clock budget exhausted")
+            requests.append(self._sanitize(payload))
+            response, headers, elapsed = self._request(
+                "POST", self.config["responses_path"], payload, timeout=max(1, remaining))
+            requests[-1]["_transport_attempts"] = self.last_request_attempts
+            requests[-1]["_utf8_bytes"] = payload_bytes
+            total_model_ms += elapsed
+            responses.append(self._sanitize(response))
+            current = response.get("usage") or {}
+            usage["input_tokens"] += int(current.get("input_tokens") or 0)
+            usage["output_tokens"] += int(current.get("output_tokens") or 0)
+            usage["total_tokens"] += int(current.get("total_tokens") or 0)
+            usage["reasoning_tokens"] += int(
+                (current.get("output_tokens_details") or {}).get("reasoning_tokens") or 0)
+            usage["cached_tokens"] += int(
+                (current.get("input_tokens_details") or {}).get("cached_tokens") or 0)
+            if response.get("status") not in {"completed", "incomplete"}:
+                raise LMStudioError(f"direct-final response failed: {response.get('error')}")
+            final = self._text(response)
+            if attempt == 0:
+                raw_final = final
+            validation_errors = validator(final)
+            if not validation_errors:
+                break
+        return {"transport": "deterministic-context", "final_text": final,
+            "raw_final_text": raw_final, "repair_attempted": bool(validation_errors) or
+                len(requests) > 1,
+            "repair_succeeded": len(requests) > 1 and not validation_errors,
+            "final_validation_errors": validation_errors,
+            "usage": usage, "requests": requests, "responses": responses,
+            "tool_events": [], "protocol_errors": [], "protocol_recoveries": [],
+            "protocol_compliance": {"errors": 0, "recoveries": 0,
+                                    "not_applicable": True},
+            "model_elapsed_ms": total_model_ms,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+            "final_size": text_size(final), "raw_final_size": text_size(raw_final),
+            "response_headers": self._sanitize(headers)}
+
     def run_tools(self, instructions: str, user_input: str,
                   tools: list[dict[str, Any]], executor: Callable[[str, dict[str, Any]], str],
                   max_tool_calls: int, max_input_bytes: int = 120000) -> dict[str, Any]:

@@ -248,6 +248,9 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
     for key, items in sorted(groups.items()):
         track, condition, task = key
         scores = [item.get("score", {}) for item in items]
+        protocol_models = [item.get("model", {}) for item in items
+            if item.get("model") and not item.get("model", {}).get(
+                "protocol_compliance", {}).get("not_applicable", False)]
         def analysis_ms(item: dict[str, Any]) -> float:
             total = 0.0
             for event in item.get("model", {}).get("tool_events", []):
@@ -263,10 +266,18 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
                  "output_tokens": sum(item.get("model", {}).get("usage", {}).get("output_tokens", 0) for item in items),
                  "total_tokens": sum(item.get("model", {}).get("usage", {}).get("total_tokens", 0) for item in items),
                  "tool_calls": sum(len(item.get("model", {}).get("tool_events", [])) for item in items),
+                 "protocol_applicable": len(protocol_models),
                  "protocol_clean": sum(
-                    item.get("model", {}).get("protocol_compliance", {}).get("errors", 0) == 0 and
-                    item.get("model", {}).get("protocol_compliance", {}).get("recoveries", 0) == 0
+                    model.get("protocol_compliance", {}).get("errors", 0) == 0 and
+                    model.get("protocol_compliance", {}).get("recoveries", 0) == 0
+                    for model in protocol_models),
+                 "final_structure_valid": sum(
+                    not item.get("model", {}).get("final_validation_errors", [])
                     for item in items if item.get("model")),
+                 "repairs_attempted": sum(bool(item.get("model", {}).get("repair_attempted"))
+                    for item in items),
+                 "repairs_succeeded": sum(bool(item.get("model", {}).get("repair_succeeded"))
+                    for item in items),
                  "transcript_compactions": sum(len(request.get("_transcript_compactions", []))
                     for item in items for request in item.get("model", {}).get("requests", [])),
                  "transport_retries": sum(max(0, int(request.get("_transport_attempts", 1)) - 1)
@@ -306,7 +317,10 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
                 if task == "objective" and group.get("fields_total", 0) else 0.0,
             "schema_validity": group.get("schema_valid", 0) / group["runs"]
                 if task == "objective" and group["runs"] else None,
-            "protocol_compliance": group.get("protocol_clean", 0) / group["runs"]
+            "protocol_compliance": group.get("protocol_clean", 0) /
+                group.get("protocol_applicable", 1)
+                if group.get("protocol_applicable", 0) else None,
+            "final_structure": group.get("final_structure_valid", 0) / group["runs"]
                 if group["runs"] else 0.0,
             "evidence_validity": group.get("evidence_valid", 0) / group.get("evidence_total", 1)
                 if task == "objective" and group.get("evidence_total", 0) else 0.0,

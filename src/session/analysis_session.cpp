@@ -254,7 +254,9 @@ xair_status AnalysisSession::build_cfg(SessionDiagnostic& diagnostic) {
             options_.max_indirect_candidate_edges;
     }
     if (!options_.build_ir) cfg_options.flags |= XAIR_CFG_BUILD_SKIP_IR;
-    if (!options_.expand_indirects) {
+    if (options_.expand_indirects) {
+        cfg_options.flags &= ~XAIR_CFG_BUILD_SKIP_INDIRECT_EXPANSION;
+    } else {
         cfg_options.flags |= XAIR_CFG_BUILD_SKIP_INDIRECT_EXPANSION;
     }
     if (!options_.analyze_indirects) {

@@ -16,6 +16,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--split", choices=("development", "heldout"), default="heldout")
     parser.add_argument("--track", action="append", choices=("common", "native"),
                         help="Run only the selected track; may be repeated")
+    parser.add_argument("--category", action="append",
+                        help="Select one deterministic case from each named category; may repeat")
     parser.add_argument("--output-root",
                         help="Override paths.output_root without editing the config")
     parser.add_argument("--no-rebuild-corpus", action="store_true")
@@ -32,6 +34,8 @@ def main(argv: list[str] | None = None) -> int:
     runner = BenchmarkRunner(root, (root / arguments.config).resolve(), overrides)
     if arguments.track:
         runner.config["tracks"] = arguments.track
+    if arguments.category:
+        runner.config["selection_categories"] = arguments.category
     if arguments.output_root:
         runner.config["paths"]["output_root"] = arguments.output_root
         runner.output = (root / arguments.output_root).resolve()

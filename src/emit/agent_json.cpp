@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string_view>
@@ -55,9 +56,19 @@ std::string evidence_id(const std::uint64_t begin, const std::uint64_t end) {
     return "A:" + hex_value(begin) + '-' + hex_value(end);
 }
 
+std::optional<std::int64_t> constant_value(const std::string_view text) {
+    try {
+        std::size_t consumed = 0;
+        const std::string value(text);
+        const std::int64_t parsed = std::stoll(value, &consumed, 0);
+        if (consumed == value.size()) return parsed;
+    } catch (const std::exception&) {
+    }
+    return std::nullopt;
+}
+
 bool simple_expression(const std::string_view value) {
-    return value.starts_with("arg") || value.starts_with("0x") ||
-        value.find_first_of(" +-*/&|^") == std::string_view::npos;
+    return value.find_first_of(" +-*/&|^") == std::string_view::npos;
 }
 
 std::string grouped(const std::string& value) {
@@ -68,6 +79,29 @@ std::string binary_expression(
     const std::string& left,
     const std::string_view operation,
     const std::string& right) {
+    if ((operation == "^" || operation == "-") && left == right) return "0";
+    if ((operation == "+" || operation == "|" || operation == "^") && left == "0") {
+        return right;
+    }
+    if ((operation == "+" || operation == "-" || operation == "|" ||
+         operation == "^") && right == "0") return left;
+    if (operation == "*" && (left == "0" || right == "0")) return "0";
+    if (operation == "*" && left == "1") return right;
+    if (operation == "*" && right == "1") return left;
+    const auto left_constant = constant_value(left);
+    const auto right_constant = constant_value(right);
+    if (left_constant && right_constant) {
+        std::int64_t value{};
+        if (operation == "+") value = *left_constant + *right_constant;
+        else if (operation == "-") value = *left_constant - *right_constant;
+        else if (operation == "&") value = *left_constant & *right_constant;
+        else if (operation == "|") value = *left_constant | *right_constant;
+        else if (operation == "^") value = *left_constant ^ *right_constant;
+        else if (operation == "*") value = *left_constant * *right_constant;
+        else return grouped(left) + ' ' + std::string(operation) + ' ' + grouped(right);
+        if (value < 0) return std::to_string(value);
+        return value <= 9 ? std::to_string(value) : hex_value(static_cast<std::uint64_t>(value));
+    }
     if (operation == "+" && left == right) return grouped(left) + " * 2";
     if (operation == "+" && right == grouped(left) + " * 2") {
         return grouped(left) + " * 3";
@@ -87,6 +121,7 @@ struct State {
     std::array<std::string, XAIR_X86_REG_COUNT> registers;
     std::array<std::int64_t, XAIR_X86_REG_COUNT> stack_offsets;
     std::map<std::string, std::string> stack_values;
+    std::map<std::uint64_t, std::string> global_values;
 };
 
 State initial_state() {
@@ -145,15 +180,39 @@ std::string memory_address(const State& state, const xair_x86_memory_operand& me
 
 std::string classify_memory(const xair_x86_memory_operand& memory);
 
+std::optional<std::uint64_t> global_address(
+    const xair_x86_memory_operand& memory,
+    const std::uint64_t instruction_end) {
+    if (memory.kind == XAIR_X86_MEM_RIP_REL) {
+        return static_cast<std::uint64_t>(
+            static_cast<std::int64_t>(instruction_end) + memory.displacement);
+    }
+    if (memory.kind == XAIR_X86_MEM_ABSOLUTE && memory.has_base == 0 &&
+        memory.has_index == 0) {
+        return static_cast<std::uint64_t>(memory.displacement);
+    }
+    return std::nullopt;
+}
+
 std::string stack_key(const State& state, const xair_x86_memory_operand& memory) {
-    if (memory.has_base == 0 || memory.has_index != 0) return {};
+    if (memory.has_base == 0) return {};
     const auto parent = static_cast<std::size_t>(memory.base.parent);
     if (parent >= state.stack_offsets.size() ||
         state.stack_offsets[parent] == std::numeric_limits<std::int64_t>::min()) return {};
-    return "stack:" + std::to_string(state.stack_offsets[parent] + memory.displacement);
+    std::int64_t offset = state.stack_offsets[parent] + memory.displacement;
+    if (memory.has_index != 0) {
+        const auto index = constant_value(register_value(state, memory.index));
+        if (!index) return {};
+        offset += *index * memory.scale;
+    }
+    return "stack:" + std::to_string(offset);
 }
 
-std::string operand_value(const State& state, const xair_x86_operand& operand) {
+std::string operand_value(
+    const xair_binary_view& binary,
+    const State& state,
+    const xair_x86_operand& operand,
+    const std::uint64_t instruction_end) {
     switch (operand.kind) {
     case XAIR_X86_OPERAND_REGISTER: return register_value(state, operand.value.reg);
     case XAIR_X86_OPERAND_IMMEDIATE: return immediate_text(operand);
@@ -161,6 +220,21 @@ std::string operand_value(const State& state, const xair_x86_operand& operand) {
         if (classify_memory(operand.value.mem) == "stack") {
             const auto found = state.stack_values.find(stack_key(state, operand.value.mem));
             if (found != state.stack_values.end()) return found->second;
+        }
+        if (const auto address = global_address(operand.value.mem, instruction_end)) {
+            if (const auto found = state.global_values.find(*address);
+                found != state.global_values.end()) return found->second;
+            if (operand.size_bits > 0 && operand.size_bits <= 64 &&
+                operand.size_bits % 8 == 0) {
+                std::uint64_t initial{};
+                const std::size_t bytes = operand.size_bits / 8;
+                if (xair_binary_view_read(&binary, *address, &initial, bytes) == XAIR_OK) {
+                    return "global" + std::to_string(operand.size_bits) + '(' +
+                        hex_value(*address) + ", initial=" + hex_value(initial) + ')';
+                }
+            }
+            return "global" + std::to_string(operand.size_bits) + '(' +
+                hex_value(*address) + ')';
         }
         return "load" + std::to_string(operand.size_bits) + "(" +
             memory_address(state, operand.value.mem) + ')';
@@ -174,11 +248,19 @@ void write_register(State& state, const xair_x86_operand& operand, std::string v
     if (parent < state.registers.size()) state.registers[parent] = std::move(value);
 }
 
-void write_stack(State& state, const xair_x86_operand& operand, std::string value) {
+void write_memory(
+    State& state,
+    const xair_x86_operand& operand,
+    std::string value,
+    const std::uint64_t instruction_end) {
     if (operand.kind == XAIR_X86_OPERAND_MEMORY &&
         classify_memory(operand.value.mem) == "stack") {
         const std::string key = stack_key(state, operand.value.mem);
         if (!key.empty()) state.stack_values[key] = std::move(value);
+    } else if (operand.kind == XAIR_X86_OPERAND_MEMORY) {
+        if (const auto address = global_address(operand.value.mem, instruction_end)) {
+            state.global_values[*address] = std::move(value);
+        }
     }
 }
 
@@ -248,13 +330,38 @@ struct NodeResult {
     State state;
     std::string return_expression;
     std::string index_expression;
+    std::optional<bool> branch_taken;
 };
 
 struct PathState {
     xair_cfg_node_id node{XAIR_CFG_INVALID_ID};
     State state;
-    std::unordered_set<xair_cfg_node_id> visited;
+    std::unordered_map<xair_cfg_node_id, std::size_t> visits;
 };
+
+std::optional<bool> evaluate_condition(
+    const std::string& left,
+    const std::string& right,
+    const xair_x86_condition condition) {
+    const auto lhs = constant_value(left);
+    const auto rhs = constant_value(right);
+    if (!lhs || !rhs) return std::nullopt;
+    const auto ulhs = static_cast<std::uint64_t>(*lhs);
+    const auto urhs = static_cast<std::uint64_t>(*rhs);
+    switch (condition) {
+    case XAIR_X86_COND_E: return *lhs == *rhs;
+    case XAIR_X86_COND_NE: return *lhs != *rhs;
+    case XAIR_X86_COND_B: return ulhs < urhs;
+    case XAIR_X86_COND_AE: return ulhs >= urhs;
+    case XAIR_X86_COND_BE: return ulhs <= urhs;
+    case XAIR_X86_COND_A: return ulhs > urhs;
+    case XAIR_X86_COND_L: return *lhs < *rhs;
+    case XAIR_X86_COND_GE: return *lhs >= *rhs;
+    case XAIR_X86_COND_LE: return *lhs <= *rhs;
+    case XAIR_X86_COND_G: return *lhs > *rhs;
+    default: return std::nullopt;
+    }
+}
 
 NodeResult interpret_node(
     const xair_binary_view& binary,
@@ -264,7 +371,7 @@ NodeResult interpret_node(
     const bool switch_header) {
     std::string compare_left;
     std::string compare_right;
-    NodeResult result{std::move(state), {}, {}};
+    NodeResult result{std::move(state), {}, {}, std::nullopt};
     std::uint64_t address = node.start;
     while (address < node.end) {
         xair_x86_decoded_inst instruction{};
@@ -276,9 +383,15 @@ NodeResult interpret_node(
         const std::uint64_t end = address + instruction.length;
         ++digest.instruction_count;
         const std::string evidence = evidence_id(address, end);
+        const bool zeroing_xor = instruction.mnemonic == XAIR_X86_MNEMONIC_XOR &&
+            instruction.visible_operand_count >= 2 &&
+            instruction.operands[0].kind == XAIR_X86_OPERAND_REGISTER &&
+            instruction.operands[1].kind == XAIR_X86_OPERAND_REGISTER &&
+            instruction.operands[0].value.reg.parent ==
+                instruction.operands[1].value.reg.parent;
         for (std::size_t index = 0; index < instruction.visible_operand_count; ++index) {
             const xair_x86_operand& operand = instruction.operands[index];
-            if (operand.kind == XAIR_X86_OPERAND_REGISTER &&
+            if (!zeroing_xor && operand.kind == XAIR_X86_OPERAND_REGISTER &&
                 (operand.actions & XAIR_X86_ACTION_READ) != 0) {
                 std::size_t argument = static_cast<std::size_t>(-1);
                 const std::string value = register_value(result.state, operand.value.reg);
@@ -306,7 +419,10 @@ NodeResult interpret_node(
                 }
             }
             if (operand.kind == XAIR_X86_OPERAND_MEMORY) {
-                const std::string kind = classify_memory(operand.value.mem);
+                const bool imported_call = instruction.mnemonic == XAIR_X86_MNEMONIC_CALL &&
+                    operand.value.mem.kind == XAIR_X86_MEM_RIP_REL;
+                const std::string kind = imported_call
+                    ? "api-mediated" : classify_memory(operand.value.mem);
                 const bool promoted_stack = kind == "stack" && operand.value.mem.has_index == 0;
                 if (!switch_header && !promoted_stack &&
                     (operand.actions & XAIR_X86_ACTION_READ) != 0) {
@@ -323,7 +439,8 @@ NodeResult interpret_node(
         }
         const auto operand = [&](const std::size_t index) {
             return index < instruction.visible_operand_count
-                ? operand_value(result.state, instruction.operands[index]) : std::string("unknown");
+                ? operand_value(binary, result.state, instruction.operands[index], end)
+                : std::string("unknown");
         };
         switch (instruction.mnemonic) {
         case XAIR_X86_MNEMONIC_MOV:
@@ -342,7 +459,7 @@ NodeResult interpret_node(
                         : std::numeric_limits<std::int64_t>::min();
                 }
                 write_register(result.state, instruction.operands[0], value);
-                write_stack(result.state, instruction.operands[0], value);
+                write_memory(result.state, instruction.operands[0], value, end);
             }
             break;
         case XAIR_X86_MNEMONIC_LEA:
@@ -443,11 +560,23 @@ NodeResult interpret_node(
                     compare_left + ' ' + condition_token(instruction.condition) + ' ' +
                         compare_right,
                     evidence});
+                result.branch_taken = evaluate_condition(
+                    compare_left, compare_right, instruction.condition);
             }
             break;
         case XAIR_X86_MNEMONIC_CALL: {
-            std::string call = instruction.branch_target_valid != 0
-                ? "direct:" + hex_value(instruction.branch_target) : "indirect";
+            std::string call;
+            if (instruction.branch_target_valid != 0) {
+                call = "direct:" + hex_value(instruction.branch_target);
+            } else if (instruction.visible_operand_count > 0 &&
+                       instruction.operands[0].kind == XAIR_X86_OPERAND_MEMORY &&
+                       instruction.operands[0].value.mem.kind == XAIR_X86_MEM_RIP_REL) {
+                const auto displacement = instruction.operands[0].value.mem.displacement;
+                call = "imported:" + hex_value(static_cast<std::uint64_t>(
+                    static_cast<std::int64_t>(end) + displacement));
+            } else {
+                call = "indirect";
+            }
             append_unique(digest.calls, {call, evidence});
             result.state.registers[XAIR_X86_RAX] = "result(" + call + ')';
             break;
@@ -470,7 +599,7 @@ NodeResult trace_return(
     const std::unordered_map<xair_cfg_node_id, std::vector<xair_cfg_node_id>>& successors,
     const std::unordered_set<xair_cfg_node_id>& switch_headers) {
     std::unordered_set<xair_cfg_node_id> visited;
-    NodeResult result{std::move(state), {}, {}};
+    NodeResult result{std::move(state), {}, {}, std::nullopt};
     for (std::size_t step = 0; step < 64 && visited.insert(node_id).second; ++step) {
         const xair_cfg_node* node = xair_cfg_get_node(&session.cfg(), node_id);
         if (node == nullptr) break;
@@ -484,22 +613,86 @@ NodeResult trace_return(
     return result;
 }
 
+bool node_ends_in_call(const xair_binary_view& binary, const xair_cfg_node& node) {
+    std::uint64_t address = node.start;
+    xair_x86_decoded_inst last{};
+    while (address < node.end) {
+        xair_x86_decoded_inst instruction{};
+        if (xair_decode_instruction(&binary, address, &instruction) != XAIR_OK ||
+            instruction.length == 0 || address + instruction.length > node.end) return false;
+        last = instruction;
+        address += instruction.length;
+    }
+    return address == node.end && last.mnemonic == XAIR_X86_MNEMONIC_CALL;
+}
+
+NodeResult interpret_linear_fallthrough(
+    const xair_binary_view& binary,
+    std::uint64_t address,
+    State state,
+    Digest& digest) {
+    NodeResult result{std::move(state), {}, {}, std::nullopt};
+    std::unordered_set<std::uint64_t> visited;
+    for (std::size_t count = 0; count < 256 && visited.insert(address).second; ++count) {
+        xair_x86_decoded_inst instruction{};
+        if (xair_decode_instruction(&binary, address, &instruction) != XAIR_OK ||
+            instruction.length == 0) break;
+        const std::uint64_t end = address + instruction.length;
+        xair_cfg_node instruction_node{};
+        instruction_node.start = address;
+        instruction_node.end = end;
+        result = interpret_node(binary, instruction_node, std::move(result.state), digest, false);
+        if (!result.return_expression.empty()) return result;
+        if (instruction.flow == XAIR_X86_FLOW_DIRECT_JUMP) {
+            if (instruction.branch_target_valid == 0) break;
+            address = instruction.branch_target;
+        } else {
+            address = end;
+        }
+    }
+    return result;
+}
+
 std::string render_digest(
     const FunctionInfo& function,
     const CompactFunctionView& semantic,
     const Digest& digest) {
     std::ostringstream out;
+    std::size_t parameter_count = digest.parameter_bits.size();
+    const auto mentions_argument = [&](const std::size_t index) {
+        const std::string name = "arg" + std::to_string(index);
+        const auto facts_mention = [&](const std::vector<Fact>& facts) {
+            return std::any_of(facts.begin(), facts.end(), [&](const Fact& fact) {
+                return fact.text.find(name) != std::string::npos;
+            });
+        };
+        if (facts_mention(digest.returns) || facts_mention(digest.conditions) ||
+            facts_mention(digest.calls) || facts_mention(digest.memory)) return true;
+        return std::any_of(digest.switches.begin(), digest.switches.end(),
+            [&](const SwitchFact& item) {
+                if (item.selector.find(name) != std::string::npos ||
+                    item.default_result.text.find(name) != std::string::npos) return true;
+                return std::any_of(item.cases.begin(), item.cases.end(),
+                    [&](const auto& entry) {
+                        return entry.second.text.find(name) != std::string::npos;
+                    });
+            });
+    };
+    while (parameter_count > 0 && digest.parameter_bits[parameter_count - 1] == 0 &&
+           !mentions_argument(parameter_count - 1)) {
+        --parameter_count;
+    }
     out << "{\"schema\":\"" << agent_json_schema << "\",\"function\":{\"entry\":\"" <<
         hex_value(function.entry) << "\",\"name\":";
     quoted(out, function.name);
-    out << ",\"parameter_count\":" << semantic.parameters.size() <<
+    out << ",\"parameter_count\":" << parameter_count <<
         ",\"instruction_count\":" << digest.instruction_count <<
         ",\"parameters\":[";
-    for (std::size_t index = 0; index < semantic.parameters.size(); ++index) {
+    for (std::size_t index = 0; index < parameter_count; ++index) {
         if (index != 0) out << ',';
         out << "{\"name\":\"arg" << index << "\",\"observed_bits\":" <<
             (index < digest.parameter_bits.size() && digest.parameter_bits[index] != 0
-                ? digest.parameter_bits[index] : 0) << '}';
+                ? digest.parameter_bits[index] : mentions_argument(index) ? 32 : 0) << '}';
     }
     out << "]},\"returns\":[";
     for (std::size_t index = 0; index < digest.returns.size(); ++index) {
@@ -563,7 +756,7 @@ std::string render_agent_json(
     const CompactFunctionView& semantic,
     const std::size_t max_bytes) {
     Digest digest;
-    digest.parameter_bits.resize(semantic.parameters.size());
+    digest.parameter_bits.resize(std::max<std::size_t>(semantic.parameters.size(), 4));
     std::unordered_map<xair_cfg_node_id, State> inputs;
     std::unordered_map<xair_cfg_node_id, NodeResult> outputs;
     std::deque<xair_cfg_node_id> worklist;
@@ -571,10 +764,43 @@ std::string render_agent_json(
     worklist.push_back(semantic.control.entry);
 
     std::unordered_map<xair_cfg_node_id, std::vector<xair_cfg_node_id>> successors;
+    std::unordered_map<xair_cfg_node_id,
+        std::unordered_map<xair_cfg_node_id, ControlTransferKind>> successor_kinds;
     std::unordered_set<xair_cfg_node_id> switch_headers;
     for (const ControlTransfer& transfer : semantic.control.transfers) {
         if (transfer.source != XAIR_CFG_INVALID_ID && transfer.target != XAIR_CFG_INVALID_ID) {
             successors[transfer.source].push_back(transfer.target);
+            successor_kinds[transfer.source][transfer.target] = transfer.kind;
+        }
+    }
+    // Compact control recovery can intentionally omit call-return fallthroughs.
+    // Supplement it with intra-function raw CFG edges so the agent digest still
+    // reaches instructions after imported or indirect calls.
+    std::size_t function_node_count = 0;
+    const xair_cfg_node_id* function_nodes = xair_cfg_function_nodes(
+        &session.cfg(), function.id, &function_node_count);
+    std::unordered_set<xair_cfg_node_id> function_members;
+    for (std::size_t index = 0; index < function_node_count; ++index) {
+        function_members.insert(function_nodes[index]);
+    }
+    for (const xair_cfg_node_id source : function_members) {
+        std::size_t edge_count = 0;
+        const xair_cfg_edge* edges = xair_cfg_node_edges(&session.cfg(), source, &edge_count);
+        for (std::size_t index = 0; index < edge_count; ++index) {
+            const xair_cfg_edge& edge = edges[index];
+            const bool call_target = edge.kind == XAIR_EDGE_CALL ||
+                edge.kind == XAIR_EDGE_INDIRECT_CALL || edge.kind == XAIR_EDGE_EXTERNAL ||
+                edge.kind == XAIR_EDGE_TAILCALL;
+            if (call_target || edge.dst == XAIR_CFG_INVALID_ID ||
+                !function_members.contains(edge.dst)) continue;
+            auto& targets = successors[source];
+            if (std::find(targets.begin(), targets.end(), edge.dst) == targets.end()) {
+                targets.push_back(edge.dst);
+            }
+            successor_kinds[source][edge.dst] =
+                edge.kind == XAIR_EDGE_CBRANCH_TRUE ? ControlTransferKind::branch_true :
+                edge.kind == XAIR_EDGE_CBRANCH_FALSE ? ControlTransferKind::branch_false :
+                ControlTransferKind::fallthrough;
         }
     }
     for (const ControlRegion& region : semantic.control.regions) {
@@ -595,6 +821,11 @@ std::string render_agent_json(
         if (node == nullptr) continue;
         NodeResult result = interpret_node(session.binary(), *node, inputs.at(node_id), digest,
             switch_headers.contains(node_id));
+        if (successors[node_id].empty() && node_ends_in_call(session.binary(), *node)) {
+            NodeResult tail = interpret_linear_fallthrough(
+                session.binary(), node->end, result.state, digest);
+            if (!tail.return_expression.empty()) result = std::move(tail);
+        }
         if (!result.return_expression.empty()) {
             append_unique(digest.returns, {result.return_expression,
                 evidence_id(node->start, node->end)});
@@ -618,7 +849,7 @@ std::string render_agent_json(
     while (!paths.empty() && explored_paths < 1024) {
         PathState path = std::move(paths.front());
         paths.pop_front();
-        if (path.node == XAIR_CFG_INVALID_ID || !path.visited.insert(path.node).second) {
+        if (path.node == XAIR_CFG_INVALID_ID || ++path.visits[path.node] > 16) {
             continue;
         }
         const xair_cfg_node* node = xair_cfg_get_node(&session.cfg(), path.node);
@@ -633,8 +864,17 @@ std::string render_agent_json(
         }
         std::unordered_set<xair_cfg_node_id> queued;
         for (const xair_cfg_node_id successor : successors[path.node]) {
+            const auto kinds = successor_kinds.find(path.node);
+            const ControlTransferKind kind = kinds != successor_kinds.end() &&
+                kinds->second.contains(successor)
+                ? kinds->second.at(successor) : ControlTransferKind::unresolved;
+            if (result.branch_taken.has_value() &&
+                ((kind == ControlTransferKind::branch_true && !*result.branch_taken) ||
+                 (kind == ControlTransferKind::branch_false && *result.branch_taken))) {
+                continue;
+            }
             if (queued.insert(successor).second) {
-                paths.push_back({successor, result.state, path.visited});
+                paths.push_back({successor, result.state, path.visits});
             }
         }
     }
