@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import json
+import pathlib
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Callable
+
+from .util import canonical_json, text_size
+
+
+class LMStudioError(RuntimeError):
+    pass
+
+
+class LMStudioAdapter:
+    def __init__(self, config: dict[str, Any], timeout: float,
+                 redactions: list[str] | None = None):
+        self.config = config
+        self.timeout = timeout
+        self.redactions = sorted((item for item in (redactions or []) if item),
+                                 key=len, reverse=True)
+        self.base_url: str | None = None
+        self.model_metadata: dict[str, Any] | None = None
+        self.last_request_attempts = 0
+
+    def _redact_text(self, text: str) -> str:
+        for item in self.redactions:
+            text = text.replace(item, "<REDACTED_PATH>")
+            text = text.replace(item.replace("\\", "/"), "<REDACTED_PATH>")
+        return text
+
+    def _sanitize(self, value: Any) -> Any:
+        if isinstance(value, str): return self._redact_text(value)
+        if isinstance(value, list): return [self._sanitize(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._sanitize(item) for key, item in value.items()
+                    if key.lower() not in {"authorization", "api_key"}}
+        return value
+
+    def _request(self, method: str, path: str, payload: Any | None = None,
+                 timeout: float | None = None) -> tuple[Any, dict[str, str], float]:
+        if self.base_url is None:
+            raise LMStudioError("base URL has not been selected")
+        data = None if payload is None else canonical_json(payload).encode("utf-8")
+        request = urllib.request.Request(self.base_url + path, data=data, method=method,
+            headers={"Content-Type": "application/json"})
+        started = time.perf_counter()
+        last_error: Exception | None = None
+        for attempt in range(1, 3):
+            self.last_request_attempts = attempt
+            try:
+                with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
+                    raw = response.read().decode("utf-8", "replace")
+                    return json.loads(raw), dict(response.headers), \
+                        round((time.perf_counter() - started) * 1000, 3)
+            except urllib.error.HTTPError as error:
+                body = error.read().decode("utf-8", "replace")
+                if error.code not in {502, 503, 504} or attempt == 2:
+                    raise LMStudioError(f"LM Studio HTTP {error.code}: {body[:4000]}") from error
+                last_error = error
+            except (OSError, ValueError) as error:
+                if attempt == 2:
+                    raise LMStudioError(f"LM Studio request failed: {error}") from error
+                last_error = error
+            time.sleep(0.25)
+        raise LMStudioError(f"LM Studio request failed: {last_error}")
+
+    def probe(self) -> dict[str, Any]:
+        errors: list[str] = []
+        required = self.config["id"]
+        for candidate in self.config["base_urls"]:
+            self.base_url = candidate.rstrip("/")
+            try:
+                models, _, _ = self._request("GET", "/v1/models", timeout=5)
+                identifiers = [item.get("id") for item in models.get("data", [])]
+                if required not in identifiers:
+                    errors.append(f"{candidate}: required model absent")
+                    continue
+                native, headers, elapsed = self._request("GET", "/api/v1/models", timeout=5)
+                match = next((item for item in native.get("models", [])
+                              if item.get("key") == required), None)
+                self.model_metadata = {"selected_base_url": self.base_url,
+                    "required_model": required, "openai_model_ids": identifiers,
+                    "native_model": match, "response_headers": self._sanitize(headers),
+                    "probe_elapsed_ms": elapsed, "transport_attempts": self.last_request_attempts}
+                return self.model_metadata
+            except LMStudioError as error:
+                errors.append(f"{candidate}: {error}")
+        self.base_url = None
+        raise LMStudioError("no configured LM Studio endpoint has the required model: " +
+                            "; ".join(errors))
+
+    def native_chat_smoke(self) -> dict[str, Any]:
+        payload = {"model": self.config["id"], "system_prompt": "Reply with OK only.",
+                   "input": "Connectivity check", "temperature": 0,
+                   "max_output_tokens": 64}
+        response, headers, elapsed = self._request(
+            "POST", self.config["native_chat_path"], payload)
+        return {"request": self._sanitize(payload), "response": self._sanitize(response),
+                "headers": self._sanitize(headers), "elapsed_ms": elapsed}
+
+    @staticmethod
+    def _text(response: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for item in response.get("output", []):
+            if item.get("type") != "message": continue
+            for content in item.get("content", []):
+                if content.get("type") == "output_text":
+                    parts.append(content.get("text", ""))
+        return "".join(parts).strip()
+
+    def run_tools(self, instructions: str, user_input: str,
+                  tools: list[dict[str, Any]], executor: Callable[[str, dict[str, Any]], str],
+                  max_tool_calls: int, max_input_bytes: int = 120000) -> dict[str, Any]:
+        if self.base_url is None:
+            self.probe()
+        requests: list[dict[str, Any]] = []
+        responses: list[dict[str, Any]] = []
+        tool_events: list[dict[str, Any]] = []
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                 "reasoning_tokens": 0, "cached_tokens": 0}
+        payload: dict[str, Any] = {"model": self.config["id"],
+            "instructions": instructions, "input": user_input, "tools": tools,
+            "tool_choice": "auto", "temperature": self.config["temperature"],
+            "seed": self.config["seed"],
+            "max_output_tokens": self.config["max_output_tokens"],
+            "max_tool_calls": max_tool_calls, "parallel_tool_calls": False,
+            "store": True}
+        started = time.perf_counter()
+        total_model_ms = 0.0
+        while True:
+            payload_bytes = len(canonical_json(payload).encode("utf-8"))
+            if payload_bytes > max_input_bytes:
+                raise LMStudioError(
+                    f"request envelope exceeds input byte budget: {payload_bytes}>{max_input_bytes}")
+            remaining = self.timeout - (time.perf_counter() - started)
+            if remaining <= 0:
+                raise LMStudioError("task wall-clock budget exhausted")
+            requests.append(self._sanitize(payload))
+            response, headers, elapsed = self._request(
+                "POST", self.config["responses_path"], payload,
+                timeout=max(1, remaining))
+            requests[-1]["_transport_attempts"] = self.last_request_attempts
+            requests[-1]["_utf8_bytes"] = payload_bytes
+            total_model_ms += elapsed
+            responses.append(self._sanitize(response))
+            current = response.get("usage") or {}
+            usage["input_tokens"] += int(current.get("input_tokens") or 0)
+            usage["output_tokens"] += int(current.get("output_tokens") or 0)
+            usage["total_tokens"] += int(current.get("total_tokens") or 0)
+            usage["reasoning_tokens"] += int(
+                (current.get("output_tokens_details") or {}).get("reasoning_tokens") or 0)
+            usage["cached_tokens"] += int(
+                (current.get("input_tokens_details") or {}).get("cached_tokens") or 0)
+            if response.get("status") not in {"completed", "incomplete"}:
+                raise LMStudioError(f"tool response failed: {response.get('error')}")
+            calls = [item for item in response.get("output", [])
+                     if item.get("type") == "function_call"]
+            if not calls:
+                final = self._text(response)
+                return {"final_text": final, "usage": usage,
+                        "requests": requests, "responses": responses,
+                        "tool_events": tool_events, "model_elapsed_ms": total_model_ms,
+                        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+                        "final_size": text_size(final), "response_headers": self._sanitize(headers)}
+            outputs: list[dict[str, Any]] = []
+            for call in calls:
+                if len(tool_events) >= max_tool_calls:
+                    result = canonical_json({"ok": False, "error": "tool-call budget exhausted"})
+                else:
+                    try:
+                        arguments = json.loads(call.get("arguments") or "{}")
+                        if not isinstance(arguments, dict):
+                            raise ValueError("arguments must be an object")
+                        result = executor(str(call.get("name")), arguments)
+                    except (ValueError, TypeError, json.JSONDecodeError) as error:
+                        arguments = {}
+                        result = canonical_json({"ok": False,
+                            "error": f"malformed tool request: {error}"})
+                    tool_events.append({"name": call.get("name"),
+                        "arguments": self._sanitize(arguments), "result": self._sanitize(result),
+                        "result_size": text_size(result)})
+                outputs.append({"type": "function_call_output",
+                                "call_id": call["call_id"], "output": result})
+            payload = {"model": self.config["id"],
+                "previous_response_id": response["id"], "input": outputs,
+                "tools": tools, "tool_choice": "auto",
+                "temperature": self.config["temperature"], "seed": self.config["seed"],
+                "max_output_tokens": self.config["max_output_tokens"],
+                "max_tool_calls": max_tool_calls - len(tool_events),
+                "parallel_tool_calls": False, "store": True}

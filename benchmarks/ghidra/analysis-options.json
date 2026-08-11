@@ -1,0 +1,10 @@
+{
+  "schema": "airece.ghidra-analysis-options.v1",
+  "analyzer_policy": "Ghidra 12.1.2 default enabled analyzers",
+  "analysis_timeout_per_file_seconds": 90,
+  "decompiler_timeout_per_function_seconds": 30,
+  "max_functions": 512,
+  "max_instructions_per_function": 2048,
+  "max_decompiled_characters": 65536,
+  "project_policy": "isolated temporary project deleted after export"
+}

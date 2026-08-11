@@ -1,0 +1,37 @@
+{
+  "schema": "airece.benchmark-config.v1",
+  "model": {
+    "id": "prism-ml/bonsai-27b",
+    "base_urls": ["http://172.18.208.1:1234", "http://localhost:1234"],
+    "responses_path": "/v1/responses",
+    "native_chat_path": "/api/v1/chat",
+    "temperature": 0,
+    "seed": 424242,
+    "max_output_tokens": 1024,
+    "reasoning_control": "server-default-on"
+  },
+  "budgets": {
+    "max_tool_calls": 6,
+    "max_tool_result_bytes": 16000,
+    "max_input_bytes": 120000,
+    "task_timeout_seconds": 180,
+    "analyzer_timeout_seconds": 30,
+    "ghidra_timeout_seconds": 90,
+    "compile_timeout_seconds": 30,
+    "execute_timeout_seconds": 3
+  },
+  "paths": {
+    "airece": "out/build/windows-msvc/Release/airece.exe",
+    "analyzer_report": "out/benchmark-analyzer-quick.json",
+    "ghidra_root": "C:/Users/Jaden/Desktop/Projects/IR/kb/ghidra_12.1.2_PUBLIC",
+    "instruction_packs": "docs/benchmark-tool-instructions.md",
+    "output_root": "out/ai-utility-benchmark"
+  },
+  "corpus": {
+    "compilers": ["msvc", "clangcl"],
+    "optimizations": ["O0", "O2"],
+    "seed": 731942
+  },
+  "tracks": ["common", "native"],
+  "conditions": ["airece", "ghidra"]
+}
