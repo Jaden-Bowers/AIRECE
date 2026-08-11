@@ -279,8 +279,18 @@ class LMStudioAdapter:
                 raise LMStudioError("JSON protocol turn budget exhausted")
             envelope = {"task": user_input, "transcript": transcript,
                         "remaining_tool_calls": max_tool_calls - executed_calls}
+            active_instructions = full_instructions
+            if executed_calls >= max_tool_calls:
+                active_instructions = instructions + """
+
+Tool access is exhausted and no tool catalog is available. Return exactly one
+JSON object with no markdown or surrounding text:
+{"action":"final","content":FINAL_VALUE}
+FINAL_VALUE must be the exact answer requested by the original task. Do not
+request another tool.
+"""
             payload: dict[str, Any] = {"model": self.config["id"],
-                "instructions": full_instructions, "input": canonical_json(envelope),
+                "instructions": active_instructions, "input": canonical_json(envelope),
                 "temperature": self.config["temperature"], "seed": self.config["seed"],
                 "max_output_tokens": self.config["max_output_tokens"], "store": False}
             if self.config.get("reasoning") is not None:

@@ -173,6 +173,27 @@ class ToolBudgetTests(unittest.TestCase):
         second_envelope = json.loads(result["requests"][1]["input"])
         self.assertEqual(second_envelope["transcript"][0]["assistant"]["name"], "echo")
 
+    def test_json_protocol_removes_tools_after_budget(self) -> None:
+        adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
+            "responses_path": "/v1/responses", "native_chat_path": "/api/v1/chat",
+            "temperature": 0, "seed": 1, "max_output_tokens": 32}, 10)
+        adapter.base_url = "http://unused"
+        responses = iter([
+            {"id": "one", "status": "completed", "usage": {}, "output": [{
+                "type": "message", "content": [{"type": "output_text",
+                    "text": '{"action":"tool","name":"echo","arguments":{}}'}]}]},
+            {"id": "two", "status": "completed", "usage": {}, "output": [{
+                "type": "message", "content": [{"type": "output_text",
+                    "text": '{"action":"final","content":"done"}'}]}]},
+        ])
+        adapter._request = lambda *args, **kwargs: (next(responses), {}, 1.0)  # type: ignore[method-assign]
+        result = adapter.run_json_protocol(
+            "instructions", "input", [{"name": "echo", "parameters": {}}],
+            lambda name, args: "{}", 1, 10000)
+        self.assertEqual(result["final_text"], "done")
+        self.assertIn("Tool access is exhausted", result["requests"][1]["instructions"])
+        self.assertNotIn("Tool catalog", result["requests"][1]["instructions"])
+
 
 if __name__ == "__main__":
     unittest.main()
