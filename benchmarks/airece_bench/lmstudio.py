@@ -8,7 +8,7 @@ import urllib.request
 from typing import Any, Callable
 
 from .prompts import prompt_snapshot
-from .util import canonical_json, text_size
+from .util import canonical_json, sha256_bytes, text_size
 
 
 class LMStudioError(RuntimeError):
@@ -290,8 +290,6 @@ class LMStudioAdapter:
             turns += 1
             if turns > max_tool_calls + 3:
                 raise LMStudioError("JSON protocol turn budget exhausted")
-            envelope = {"task": user_input, "transcript": transcript,
-                        "remaining_tool_calls": max_tool_calls - executed_calls}
             active_instructions = full_instructions
             if executed_calls >= max_tool_calls:
                 active_instructions = instructions + """
@@ -302,13 +300,41 @@ JSON object with no markdown or surrounding text:
 FINAL_VALUE must be the exact answer requested by the original task. Do not
 request another tool.
 """
-            payload: dict[str, Any] = {"model": self.config["id"],
-                "instructions": active_instructions, "input": canonical_json(envelope),
-                "temperature": self.config["temperature"], "seed": self.config["seed"],
-                "max_output_tokens": self.config["max_output_tokens"], "store": False}
-            if self.config.get("reasoning") is not None:
-                payload["reasoning"] = self.config["reasoning"]
-            payload_bytes = len(canonical_json(payload).encode("utf-8"))
+            prompt_transcript = json.loads(canonical_json(transcript))
+            request_limit = min(max_input_bytes,
+                int(self.config.get("max_protocol_request_bytes", max_input_bytes)))
+            compactions: list[dict[str, Any]] = []
+            while True:
+                envelope = {"task": user_input, "transcript": prompt_transcript,
+                            "remaining_tool_calls": max_tool_calls - executed_calls}
+                payload: dict[str, Any] = {"model": self.config["id"],
+                    "instructions": active_instructions, "input": canonical_json(envelope),
+                    "temperature": self.config["temperature"], "seed": self.config["seed"],
+                    "max_output_tokens": self.config["max_output_tokens"], "store": False}
+                if self.config.get("reasoning") is not None:
+                    payload["reasoning"] = self.config["reasoning"]
+                payload_bytes = len(canonical_json(payload).encode("utf-8"))
+                if payload_bytes <= request_limit:
+                    break
+                compacted = False
+                for index, event in enumerate(prompt_transcript):
+                    controller = event.get("controller", {})
+                    result = controller.get("tool_result")
+                    if isinstance(result, str) and len(result) > 256:
+                        result_bytes = result.encode("utf-8")
+                        controller["tool_result"] = canonical_json({
+                            "omitted_from_prompt": True,
+                            "sha256": sha256_bytes(result_bytes),
+                            "utf8_bytes": len(result_bytes)})
+                        compactions.append({"transcript_index": index,
+                            "sha256": sha256_bytes(result_bytes),
+                            "utf8_bytes": len(result_bytes)})
+                        compacted = True
+                        break
+                if not compacted:
+                    raise LMStudioError(
+                        f"request envelope cannot fit protocol byte budget: "
+                        f"{payload_bytes}>{request_limit}")
             if payload_bytes > max_input_bytes:
                 raise LMStudioError(
                     f"request envelope exceeds input byte budget: {payload_bytes}>{max_input_bytes}")
@@ -320,6 +346,7 @@ request another tool.
                 "POST", self.config["responses_path"], payload, timeout=max(1, remaining))
             requests[-1]["_transport_attempts"] = self.last_request_attempts
             requests[-1]["_utf8_bytes"] = payload_bytes
+            requests[-1]["_transcript_compactions"] = compactions
             total_model_ms += elapsed
             responses.append(self._sanitize(response))
             current = response.get("usage") or {}
@@ -334,8 +361,7 @@ request another tool.
                 raise LMStudioError(f"JSON protocol response failed: {response.get('error')}")
             raw = self._text(response)
             value = self._protocol_object(raw)
-            if (executed_calls >= max_tool_calls and
-                    (value is None or value.get("action") not in {"tool", "final"})):
+            if executed_calls >= max_tool_calls and (value is None or value.get("action") != "final"):
                 protocol_recoveries.append(
                     "accepted raw final after tool budget exhaustion")
                 return finish(raw.strip(), headers)

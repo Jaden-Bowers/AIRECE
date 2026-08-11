@@ -10,7 +10,8 @@
     "max_output_tokens": 1024,
     "reasoning_control": "explicit-none",
     "reasoning": {"effort": "none"},
-    "tool_transport": "json-protocol"
+    "tool_transport": "json-protocol",
+    "max_protocol_request_bytes": 28000
   },
   "budgets": {
     "max_tool_calls": 6,

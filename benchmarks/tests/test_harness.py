@@ -194,7 +194,7 @@ class ToolBudgetTests(unittest.TestCase):
         self.assertIn("Tool access is exhausted", result["requests"][1]["instructions"])
         self.assertNotIn("Tool catalog", result["requests"][1]["instructions"])
 
-    def test_json_protocol_accepts_raw_final_after_budget(self) -> None:
+    def test_json_protocol_accepts_nonfinal_response_after_budget(self) -> None:
         adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
             "responses_path": "/v1/responses", "native_chat_path": "/api/v1/chat",
             "temperature": 0, "seed": 1, "max_output_tokens": 32}, 10)
@@ -205,15 +205,38 @@ class ToolBudgetTests(unittest.TestCase):
                     "text": '{"action":"tool","name":"echo","arguments":{}}'}]}]},
             {"id": "two", "status": "completed", "usage": {}, "output": [{
                 "type": "message", "content": [{"type": "output_text",
-                    "text": '{"answer":1}'}]}]},
+                    "text": '{"action":"tool","name":"echo","arguments":{}}'}]}]},
         ])
         adapter._request = lambda *args, **kwargs: (next(responses), {}, 1.0)  # type: ignore[method-assign]
         result = adapter.run_json_protocol(
             "instructions", "input", [{"name": "echo", "parameters": {}}],
             lambda name, args: "{}", 1, 10000)
-        self.assertEqual(result["final_text"], '{"answer":1}')
+        self.assertEqual(result["final_text"],
+                         '{"action":"tool","name":"echo","arguments":{}}')
         self.assertEqual(result["protocol_recoveries"],
                          ["accepted raw final after tool budget exhaustion"])
+
+    def test_json_protocol_compacts_old_tool_results(self) -> None:
+        adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
+            "responses_path": "/v1/responses", "native_chat_path": "/api/v1/chat",
+            "temperature": 0, "seed": 1, "max_output_tokens": 32,
+            "max_protocol_request_bytes": 2500}, 10)
+        adapter.base_url = "http://unused"
+        responses = iter([
+            {"id": "one", "status": "completed", "usage": {}, "output": [{
+                "type": "message", "content": [{"type": "output_text",
+                    "text": '{"action":"tool","name":"echo","arguments":{}}'}]}]},
+            {"id": "two", "status": "completed", "usage": {}, "output": [{
+                "type": "message", "content": [{"type": "output_text",
+                    "text": '{"action":"final","content":"done"}'}]}]},
+        ])
+        adapter._request = lambda *args, **kwargs: (next(responses), {}, 1.0)  # type: ignore[method-assign]
+        result = adapter.run_json_protocol(
+            "instructions", "input", [{"name": "echo", "parameters": {}}],
+            lambda name, args: "x" * 5000, 2, 10000)
+        compactions = result["requests"][1]["_transcript_compactions"]
+        self.assertEqual(len(compactions), 1)
+        self.assertEqual(compactions[0]["utf8_bytes"], 5000)
 
 
 if __name__ == "__main__":
