@@ -20,6 +20,8 @@ Locations
 - Existing AIRECE tests: C:\Users\Jaden\Desktop\Projects\AIRECE\tests
 - Frozen analyzer definition:
   C:\Users\Jaden\Desktop\Projects\AIRECE\BENCHMARK_FREEZE.md
+- Matched benchmark instruction packs:
+  C:\Users\Jaden\Desktop\Projects\AIRECE\docs\benchmark-tool-instructions.md
 
 The analyzer under test is the annotated Git tag
 v0.10.0-benchmark-rc1. Treat that tag and its dependency revisions as
@@ -40,14 +42,16 @@ Before doing anything else
 3. Locate Ghidra's actual `support\analyzeHeadless.bat` and verify a trivial
    import/decompile/export smoke test. Use Ghidra headless scripts, not an MCP
    server and not its GUI.
-4. Inspect the machine for an already installed local model runner and models.
-   Do not download a model and do not use a paid/cloud API. Select the strongest
-   instruction-following/tool-capable local model no larger than approximately
-   17B parameters. Record the model file/name, hash where available,
-   quantization, context length, runner version, prompt template, seed,
-   temperature, and all generation settings. If no usable runner or model can
-   be found, finish the harness and stop with one precise configuration question
-   instead of silently substituting another model.
+4. The benchmark model is Bonsai 27B, a roughly 4 GB ternary quantization of a
+   Qwen3.6 27B model with reasoning, coding, vision, and tool-use capabilities.
+   Inspect the machine to locate the already installed Bonsai model and its
+   local runner. Do not download a model and do not use a paid/cloud API. Record
+   the exact model path/name, file hash where available, quantization/build
+   metadata, context length, runner version, chat/prompt template, reasoning
+   controls, seed, temperature, and every generation setting. Do not substitute
+   a smaller or different model without explicit user approval. If Bonsai or a
+   compatible runner cannot be found, finish the harness and stop with one
+   precise configuration question.
 
 Goal and experimental question
 ------------------------------
@@ -66,7 +70,13 @@ attractive pseudocode.
 Required benchmark conditions
 -----------------------------
 
-Implement at least these independent conditions:
+Implement two comparison tracks. The first is a blinded common-capability track
+whose abstract operation names and schemas are identical across backends. The
+second is a realistic native-agent track using the matched, condition-specific
+instruction packs in `docs/benchmark-tool-instructions.md`. Count those
+instructions in each condition's token budget and store their hashes.
+
+Implement at least these independent backends in both applicable tracks:
 
 1. `airece`: the model may use only the frozen AIRECE CLI and its documented
    compact, JSON, pseudo, calls, xrefs, evidence, slice, path, and flow commands.
@@ -85,6 +95,11 @@ small JSON tool-request protocol for every condition. The controller should
 execute requests and return bounded results. Reject malformed or unavailable
 tool requests consistently. Record every prompt, request, tool result, token
 count, latency, and final answer.
+
+The matched tool instructions are an experimental control. Do not rely on the
+model's pretrained knowledge of Ghidra command names, and do not leave AIRECE
+undocumented. Validate prompt isolation and the blinded schemas as specified in
+`docs/benchmark-tool-instructions.md`.
 
 Dataset
 -------
@@ -220,6 +235,7 @@ document with CLI overrides. Provide:
 - hidden-oracle reconstruction compilation/testing;
 - paired scoring and confidence intervals;
 - unit tests for parsers, scoring, leakage checks, and resume behavior;
+- unit tests for instruction-pack isolation, hashing, and common-schema parity;
 - `--dry-run`, `--max-cases`, `--repetitions`, and per-stage timeout controls;
 - README instructions containing exact commands;
 - machine-readable `manifest.json`, `runs.jsonl`, `summary.json`, and a concise
