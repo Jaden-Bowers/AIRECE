@@ -266,6 +266,7 @@ class LMStudioAdapter:
         responses: list[dict[str, Any]] = []
         tool_events: list[dict[str, Any]] = []
         protocol_errors: list[str] = []
+        protocol_recoveries: list[str] = []
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
                  "reasoning_tokens": 0, "cached_tokens": 0}
         transcript: list[dict[str, Any]] = []
@@ -273,6 +274,18 @@ class LMStudioAdapter:
         total_model_ms = 0.0
         executed_calls = 0
         turns = 0
+
+        def finish(final: str, headers: dict[str, Any]) -> dict[str, Any]:
+            return {"transport": "json-protocol", "final_text": final,
+                "usage": usage, "requests": requests, "responses": responses,
+                "tool_events": tool_events, "protocol_errors": protocol_errors,
+                "protocol_recoveries": protocol_recoveries,
+                "model_elapsed_ms": total_model_ms,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+                "final_size": text_size(final),
+                "response_headers": self._sanitize(headers),
+                "protocol_instructions": prompt_snapshot(protocol)}
+
         while True:
             turns += 1
             if turns > max_tool_calls + 3:
@@ -321,6 +334,11 @@ request another tool.
                 raise LMStudioError(f"JSON protocol response failed: {response.get('error')}")
             raw = self._text(response)
             value = self._protocol_object(raw)
+            if (executed_calls >= max_tool_calls and
+                    (value is None or value.get("action") not in {"tool", "final"})):
+                protocol_recoveries.append(
+                    "accepted raw final after tool budget exhaustion")
+                return finish(raw.strip(), headers)
             if value is None or value.get("action") not in {"tool", "final"}:
                 message = "malformed JSON protocol response"
                 protocol_errors.append(message + ": " + raw[:1000])
@@ -331,14 +349,7 @@ request another tool.
             elif value["action"] == "final":
                 content = value.get("content")
                 final = content if isinstance(content, str) else canonical_json(content)
-                return {"transport": "json-protocol", "final_text": final,
-                    "usage": usage, "requests": requests, "responses": responses,
-                    "tool_events": tool_events, "protocol_errors": protocol_errors,
-                    "model_elapsed_ms": total_model_ms,
-                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
-                    "final_size": text_size(final),
-                    "response_headers": self._sanitize(headers),
-                    "protocol_instructions": prompt_snapshot(protocol)}
+                return finish(final, headers)
             else:
                 name = value.get("name")
                 arguments = value.get("arguments")
