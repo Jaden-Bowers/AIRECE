@@ -269,6 +269,11 @@ xair_status AnalysisSession::build_cfg(SessionDiagnostic& diagnostic) {
         return status;
     }
     status = xair_cfg_add_root(builder, binary_.entry);
+    for (const std::uint64_t root : options_.manual_roots) {
+        if (status != XAIR_OK) break;
+        if (root == 0 || root == binary_.entry) continue;
+        status = xair_cfg_add_root(builder, root);
+    }
     if (status == XAIR_OK) {
         xair_diagnostic raw_diagnostic{};
         status = xair_cfg_build_ex(
@@ -278,7 +283,7 @@ xair_status AnalysisSession::build_cfg(SessionDiagnostic& diagnostic) {
         }
     } else {
         diagnostic = {status, XAIR_STAGE_CFG, binary_.entry,
-                      "entry root creation failed"};
+                      "CFG root creation failed"};
     }
     xair_cfg_builder_destroy(builder);
     if (status != XAIR_OK) return status;

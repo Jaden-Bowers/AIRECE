@@ -115,6 +115,15 @@ FUNCTIONS: dict[str, dict[str, Any]] = {
         "oracle": indirect},
 }
 
+CONTROL_SHAPES = {
+    "bit-manipulation": "straight-line", "sparse-switch": "sparse-switch",
+    "loop-and-array": "loop", "nested-branches": "nested-branch",
+    "direct-calls": "call-oriented", "api-source-sink-flow": "call-oriented",
+    "structure-access": "straight-line", "recursion": "recursive",
+    "dense-switch": "dense-switch", "global-read-write": "straight-line",
+    "indirect-call": "call-oriented",
+}
+
 
 TEST_INPUTS = [(0, 0), (1, 2), (3, 4), (9, 100), (17, 0xffffffff),
                (0x12345678, 31), (0xffffffff, 1), (6, 101), (8, 7),
@@ -258,6 +267,20 @@ def build(root: pathlib.Path, config: dict[str, Any], output: pathlib.Path) -> d
             truth = {key: value for key, value in definition.items()
                      if key not in {"source", "oracle", "tasks"}}
             truth["parameter_count"] = 2
+            category = truth["category"]
+            truth["control_shape"] = CONTROL_SHAPES[category]
+            truth["stack_memory_reads"] = category == "loop-and-array"
+            truth["stack_memory_writes"] = category == "loop-and-array"
+            truth["external_memory_reads"] = category in {
+                "api-source-sink-flow", "global-read-write", "indirect-call"}
+            truth["external_memory_writes"] = category in {
+                "api-source-sink-flow", "global-read-write"}
+            truth["imported_call_count"] = 2 if category == "api-source-sink-flow" else 0
+            truth["indirect_call_count"] = 1 if category == "indirect-call" else 0
+            if category == "api-source-sink-flow":
+                truth["direct_call_count"] = 0
+            truth.pop("memory_reads", None)
+            truth.pop("memory_writes", None)
             cases.append({"case_id": case_id, "split": "development" if function_name in
                           {"f_19a7d3e1", "f_60ac2836"} else "heldout",
                           "artifact_id": artifact["id"], "binary": artifact["path"],

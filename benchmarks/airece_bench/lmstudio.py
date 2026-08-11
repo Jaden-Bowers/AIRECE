@@ -267,7 +267,8 @@ class LMStudioAdapter:
                           tools: list[dict[str, Any]],
                           executor: Callable[[str, dict[str, Any]], str],
                           max_tool_calls: int,
-                          max_input_bytes: int = 120000) -> dict[str, Any]:
+                          max_input_bytes: int = 120000,
+                          final_schema: dict[str, Any] | None = None) -> dict[str, Any]:
         if self.base_url is None:
             self.probe()
         protocol = json_protocol_instructions(tools)
@@ -294,7 +295,62 @@ class LMStudioAdapter:
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
                 "final_size": text_size(final),
                 "response_headers": self._sanitize(headers),
-                "protocol_instructions": prompt_snapshot(protocol)}
+                "protocol_instructions": prompt_snapshot(protocol),
+                "protocol_compliance": {"errors": len(protocol_errors),
+                    "recoveries": len(protocol_recoveries)},
+                "final_generation_separated": bool(
+                    self.config.get("separate_final_generation"))}
+
+        def direct_final(draft: str, prior_headers: dict[str, Any]) -> dict[str, Any]:
+            nonlocal total_model_ms
+            if not self.config.get("separate_final_generation"):
+                return finish(draft, prior_headers)
+            evidence = [{"tool": event.get("name"), "result": event.get("result")}
+                        for event in tool_events]
+            final_input = canonical_json({"task": user_input, "evidence": evidence,
+                                          "draft": draft})
+            final_instructions = instructions + """
+
+Tool selection is complete and tools are unavailable. Produce only the exact final answer
+requested by the task. Do not emit a tool-protocol wrapper, commentary, or markdown fence.
+"""
+            if final_schema is not None:
+                final_instructions += "\nThe required final JSON schema is:\n" + \
+                    canonical_json(final_schema) + "\n"
+            payload: dict[str, Any] = {"model": self.config["id"],
+                "instructions": final_instructions, "input": final_input,
+                "temperature": self.config["temperature"], "seed": self.config["seed"],
+                "max_output_tokens": self.config["max_output_tokens"], "store": False}
+            if final_schema is not None and self.config.get("schema_constrained_final"):
+                payload["text"] = {"format": {"type": "json_schema",
+                    "name": "objective_answers", "schema": final_schema, "strict": True}}
+            if self.config.get("reasoning") is not None:
+                payload["reasoning"] = self.config["reasoning"]
+            payload_bytes = len(canonical_json(payload).encode("utf-8"))
+            if payload_bytes > max_input_bytes:
+                raise LMStudioError(
+                    f"direct-final envelope exceeds input byte budget: {payload_bytes}>{max_input_bytes}")
+            remaining = self.timeout - (time.perf_counter() - started)
+            if remaining <= 0:
+                raise LMStudioError("task wall-clock budget exhausted before final generation")
+            requests.append(self._sanitize(payload))
+            response, headers, elapsed = self._request(
+                "POST", self.config["responses_path"], payload, timeout=max(1, remaining))
+            requests[-1]["_transport_attempts"] = self.last_request_attempts
+            requests[-1]["_utf8_bytes"] = payload_bytes
+            total_model_ms += elapsed
+            responses.append(self._sanitize(response))
+            current = response.get("usage") or {}
+            usage["input_tokens"] += int(current.get("input_tokens") or 0)
+            usage["output_tokens"] += int(current.get("output_tokens") or 0)
+            usage["total_tokens"] += int(current.get("total_tokens") or 0)
+            usage["reasoning_tokens"] += int(
+                (current.get("output_tokens_details") or {}).get("reasoning_tokens") or 0)
+            usage["cached_tokens"] += int(
+                (current.get("input_tokens_details") or {}).get("cached_tokens") or 0)
+            if response.get("status") not in {"completed", "incomplete"}:
+                raise LMStudioError(f"direct-final response failed: {response.get('error')}")
+            return finish(self._text(response), headers)
 
         while True:
             turns += 1
@@ -374,11 +430,11 @@ request another tool.
             if raw.strip() and (value is None or value.get("action") not in {"tool", "final"}):
                 protocol_recoveries.append(
                     "accepted non-protocol model output as final")
-                return finish(raw.strip(), headers)
+                return direct_final(raw.strip(), headers)
             if executed_calls >= max_tool_calls and (value is None or value.get("action") != "final"):
                 protocol_recoveries.append(
                     "accepted raw final after tool budget exhaustion")
-                return finish(raw.strip(), headers)
+                return direct_final(raw.strip(), headers)
             if value is None or value.get("action") not in {"tool", "final"}:
                 message = "malformed JSON protocol response"
                 protocol_errors.append(message + ": " + raw[:1000])
@@ -389,7 +445,7 @@ request another tool.
             elif value["action"] == "final":
                 content = value.get("content")
                 final = content if isinstance(content, str) else canonical_json(content)
-                return finish(final, headers)
+                return direct_final(final, headers)
             else:
                 name = value.get("name")
                 arguments = value.get("arguments")

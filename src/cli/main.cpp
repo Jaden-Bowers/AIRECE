@@ -1,4 +1,5 @@
 #include <airece/session/analysis_session.hpp>
+#include <airece/emit/agent_json.hpp>
 #include <airece/emit/semantic_json.hpp>
 #include <airece/emit/semantic_text.hpp>
 #include <airece/semantic/api_model.hpp>
@@ -96,7 +97,7 @@ void print_help() {
         << "  --no-repeated-values\n"
         << "  --no-buffers\n\n"
         << "Semantic function options:\n"
-        << "  --view <compact|pseudo|ir|json>\n"
+        << "  --view <agent|compact|pseudo|ir|json>\n"
         << "  --json (alias for --view json)\n"
         << "  --max-bytes <count>\n"
         << "  --max-statements <count>\n"
@@ -316,7 +317,7 @@ bool parse_analysis_options(
         } else if (compact_options != nullptr && option == "--offset") {
             if (!assign_size(option, value, compact_options->call_offset)) return false;
         } else if (semantic_view != nullptr && option == "--view") {
-            if (value != "compact" && value != "pseudo" &&
+            if (value != "agent" && value != "compact" && value != "pseudo" &&
                 value != "ir" && value != "json") {
                 std::cerr << "airece: unsupported function view: " << value << '\n';
                 return false;
@@ -508,6 +509,7 @@ int variables_command(const int argc, char** argv) {
         std::cerr << "airece: vars requires IR construction; remove --no-ir\n";
         return exit_usage;
     }
+    analysis_options.manual_roots.push_back(address);
     airece::SessionOpenResult opened = airece::AnalysisSession::open(
         std::filesystem::path(argv[2]), analysis_options);
     if (!opened) return report_open_failure(opened.diagnostic);
@@ -573,6 +575,7 @@ int function_command(const int argc, char** argv) {
         std::cerr << "airece: fn requires IR construction; remove --no-ir\n";
         return exit_usage;
     }
+    analysis_options.manual_roots.push_back(address);
     airece::SessionOpenResult opened = airece::AnalysisSession::open(
         std::filesystem::path(argv[2]), analysis_options);
     if (!opened) return report_open_failure(opened.diagnostic);
@@ -611,6 +614,12 @@ int function_command(const int argc, char** argv) {
         std::cout << airece::render_function_ir(opened.session->cfg(),
             *opened.session->module(), function->id);
         return is_complete(*opened.session) ? exit_success : exit_partial;
+    }
+    if (view_name == "agent") {
+        std::cout << airece::render_agent_json(
+            *opened.session, *function, semantic, compact_options.max_bytes);
+        return is_complete(*opened.session) && semantic.complete
+            ? exit_success : exit_partial;
     }
     if (view_name == "json") {
         const std::string rendered = airece::render_semantic_json(
@@ -653,6 +662,7 @@ int calls_command(const int argc, char** argv) {
     }
     airece::AnalysisOptions options;
     if (!parse_analysis_options(argc, argv, first_option, options)) return exit_usage;
+    if (filtered) options.manual_roots.push_back(address);
     const auto opened = airece::AnalysisSession::open(argv[2], options);
     if (!opened) return report_open_failure(opened.diagnostic);
     const airece::FunctionInfo* owner = filtered
@@ -1034,6 +1044,7 @@ int taint_command(const int argc, char** argv) {
     enrichment.taint = true;
     if (!parse_analysis_options(argc, argv, 4, analysis, nullptr, nullptr, nullptr, nullptr,
             &enrichment)) return exit_usage;
+    analysis.manual_roots.push_back(address);
     const auto opened = airece::AnalysisSession::open(argv[2], analysis);
     if (!opened) return report_open_failure(opened.diagnostic);
     const auto* function = opened.session->function_by_address(address);

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pathlib
 import time
+import copy
 from typing import Any, Callable
 
 from .ghidra import GhidraExtractor
@@ -32,7 +33,7 @@ AIRECE_NATIVE_TOOLS = [COMMON_TOOLS[0],
     {**COMMON_TOOLS[1], "name": "functions"},
     {"type": "function", "name": "fn", "description": "Render an AIRECE function view.",
      "parameters": {"type": "object", "properties": {"address": {"type": "string"},
-        "view": {"type": "string", "enum": ["compact", "json", "pseudo", "ir"]}},
+        "view": {"type": "string", "enum": ["agent", "compact", "json", "pseudo", "ir"]}},
         "required": ["address", "view"], "additionalProperties": False}},
     COMMON_TOOLS[3], COMMON_TOOLS[4],
     {"type": "function", "name": "evidence", "description": "Resolve an AIRECE evidence or statement identifier.",
@@ -69,13 +70,51 @@ class Backend:
     def __init__(self, binary: pathlib.Path, max_bytes: int):
         self.binary = binary
         self.max_bytes = max_bytes
+        self._calls: dict[str, tuple[int, str]] = {}
+        self._call_number = 0
 
-    def _bounded(self, text: str, metadata: dict[str, Any] | None = None) -> str:
-        encoded = text.encode("utf-8")
-        if len(encoded) <= self.max_bytes:
-            return text
-        prefix = encoded[:max(0, self.max_bytes - 128)].decode("utf-8", "ignore")
-        return prefix + "\n[bounded result truncated; absence is not negative evidence]"
+    def _bounded(self, value: Any) -> str:
+        value = copy.deepcopy(value)
+        omitted = 0
+        rendered = canonical_json(value)
+        while len(rendered.encode("utf-8")) > self.max_bytes:
+            lists: list[list[Any]] = []
+            fields: list[tuple[dict[str, Any], str]] = []
+            def collect(item: Any) -> None:
+                if isinstance(item, list):
+                    if item:
+                        lists.append(item)
+                    for child in item:
+                        collect(child)
+                elif isinstance(item, dict):
+                    for key, child in item.items():
+                        if isinstance(child, str) and key not in {"entry", "name", "error"}:
+                            fields.append((item, key))
+                        collect(child)
+            collect(value)
+            if lists:
+                max(lists, key=lambda item: len(canonical_json(item[-1]).encode("utf-8"))).pop()
+            elif fields:
+                owner, key = max(fields, key=lambda item: len(item[0][item[1]].encode("utf-8")))
+                del owner[key]
+            else:
+                return canonical_json({"ok": False, "error": "bounded result unavailable",
+                                       "omitted": {"records": omitted + 1}})
+            omitted += 1
+            if isinstance(value, dict):
+                value["omitted"] = {"records": omitted}
+            rendered = canonical_json(value)
+        return rendered
+
+    def execute(self, name: str, arguments: dict[str, Any], track: str) -> str:
+        key = canonical_json({"name": name, "arguments": arguments, "track": track})
+        self._call_number += 1
+        if key in self._calls:
+            original, _ = self._calls[key]
+            return canonical_json({"ok": True, "same_result_as_call": original})
+        result = self._execute(name, arguments, track)
+        self._calls[key] = (self._call_number, result)
+        return result
 
 
 class AireceBackend(Backend):
@@ -85,16 +124,16 @@ class AireceBackend(Backend):
         self.executable = executable
         self.timeout = timeout
 
-    def execute(self, name: str, arguments: dict[str, Any], track: str) -> str:
+    def _execute(self, name: str, arguments: dict[str, Any], track: str) -> str:
         if track == "common":
             name = {"list_functions": "functions", "function_context": "fn"}.get(name, name)
         command = [str(self.executable)]
-        if name == "inspect": command += ["inspect", str(self.binary), "--profile", "fast"]
-        elif name == "functions": command += ["functions", str(self.binary), "--profile", "fast"]
+        if name == "inspect": command += ["inspect", str(self.binary), "--profile", "balanced"]
+        elif name == "functions": command += ["functions", str(self.binary), "--profile", "balanced"]
         elif name == "fn":
-            view = arguments.get("view") or ("compact" if arguments.get("level") == "primary" else "ir")
+            view = arguments.get("view") or ("agent" if arguments.get("level") == "primary" else "ir")
             command += ["fn", str(self.binary), str(arguments["address"]), "--view", view,
-                        "--profile", "fast", "--max-bytes", str(self.max_bytes),
+                        "--profile", "balanced", "--max-bytes", str(self.max_bytes),
                         "--max-statements", "256", "--max-evidence", "256"]
         elif name in {"calls", "xrefs"}:
             command += [name, str(self.binary), str(arguments["address"])]
@@ -110,10 +149,14 @@ class AireceBackend(Backend):
         else:
             return canonical_json({"ok": False, "error": "unavailable tool"})
         result = run(command, self.binary.parent, self.timeout)
-        return self._bounded(canonical_json({"ok": result["exit"] in (0, 3),
+        try:
+            stdout: Any = json.loads(result["stdout"])
+        except json.JSONDecodeError:
+            stdout = result["stdout"]
+        return self._bounded({"ok": result["exit"] in (0, 3),
             "partial": result["exit"] == 3, "exit": result["exit"],
-            "elapsed_ms": result["elapsed_ms"], "stdout": result["stdout"],
-            "stderr": result["stderr"][-1000:]}))
+            "elapsed_ms": result["elapsed_ms"], "result": stdout,
+            "stderr": result["stderr"][-1000:]})
 
 
 class GhidraBackend(Backend):
@@ -129,7 +172,7 @@ class GhidraBackend(Backend):
                 return function
         return None
 
-    def execute(self, name: str, arguments: dict[str, Any], track: str) -> str:
+    def _execute(self, name: str, arguments: dict[str, Any], track: str) -> str:
         started = time.perf_counter()
         if name == "inspect": value: Any = self.document["program"]
         elif name == "list_functions":
@@ -153,6 +196,6 @@ class GhidraBackend(Backend):
                            "from_function_calls": function["calls"]}
         else:
             return canonical_json({"ok": False, "error": "unavailable tool"})
-        return self._bounded(canonical_json({"ok": True,
+        return self._bounded({"ok": True,
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
-            "result": value}))
+            "result": value})

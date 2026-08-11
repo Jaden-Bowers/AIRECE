@@ -103,6 +103,7 @@ def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
     expected = {
         "airece_semantic_load", "airece_semantic_branch",
         "airece_semantic_switch", "airece_semantic_dense_switch",
+        "airece_semantic_agent_dense_switch",
         "airece_semantic_loop", "airece_semantic_storage",
         "airece_semantic_transform", "airece_semantic_interproc",
         "airece_semantic_memory_flow",
@@ -116,6 +117,7 @@ def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
         "airece_semantic_branch": 1,
         "airece_semantic_switch": 1,
         "airece_semantic_dense_switch": 1,
+        "airece_semantic_agent_dense_switch": 2,
         "airece_semantic_loop": 2,
         "airece_semantic_storage": 1,
         "airece_semantic_transform": 1,
@@ -205,6 +207,30 @@ def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
                     [0, 1, 2, 3, 4, 5] for region in mappings)):
                 raise AssertionError(
                     f"dense switch lacks its exact source case values: {mappings}")
+
+        if name == "airece_semantic_agent_dense_switch" and optimized:
+            raw_agent = run(
+                airece, "fn", str(fixture), address, "--view", "agent",
+                "--profile", "balanced", "--max-bytes", "4096",
+                "--max-statements", "128", "--max-evidence", "128",
+            )
+            if len(raw_agent.encode("utf-8")) > 4096:
+                raise AssertionError("agent view exceeded its byte budget")
+            agent = json.loads(raw_agent)
+            if agent["function"]["entry"].lower() != address.lower():
+                raise AssertionError(f"agent view resolved the wrong entry: {agent}")
+            switches = agent.get("switches", [])
+            expected_results = [
+                "arg1 + 0xb", "arg1 * 3", "arg1 - 0x13",
+                "arg1 ^ 0x55", "arg1 + 0x65", "arg1 - 7",
+            ]
+            if (len(switches) != 1 or switches[0]["selector"] != "arg0 & 7" or
+                    [item["value"] for item in switches[0]["cases"]] != list(range(6)) or
+                    [item["result"] for item in switches[0]["cases"]] != expected_results or
+                    switches[0]["default"]["result"] != "arg1 ^ 0x313"):
+                raise AssertionError(f"agent dense-switch semantics incomplete: {switches}")
+            if agent.get("memory_effects") or "trap" in raw_agent.lower():
+                raise AssertionError(f"agent view leaked dispatch machinery: {agent}")
 
         pseudo = run(
             airece, "fn", str(fixture), address, "--view", "pseudo",

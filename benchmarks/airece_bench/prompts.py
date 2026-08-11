@@ -24,20 +24,33 @@ OBJECTIVE_SCHEMA = {
                     "question_id": {"type": "string", "enum": ["q1", "q2"]},
                     "status": {"type": "string", "enum": ["answered", "unknown"]},
                     "parameter_count": {"type": ["integer", "null"]},
-                    "category": {"type": ["string", "null"]},
+                    "category": {"type": ["string", "null"], "enum": [None,
+                        "bit-manipulation", "sparse-switch", "loop-and-array",
+                        "nested-branches", "direct-calls", "api-source-sink-flow",
+                        "structure-access", "recursion", "dense-switch",
+                        "global-read-write", "indirect-call"]},
+                    "control_shape": {"type": ["string", "null"], "enum": [None,
+                        "straight-line", "branch", "nested-branch", "loop",
+                        "sparse-switch", "dense-switch", "call-oriented", "recursive"]},
                     "constants": {"type": "array", "items": {"type": "integer"}},
                     "case_values": {"type": "array", "items": {"type": "integer"}},
                     "return_dependencies": {"type": "array", "items": {
                         "type": "string", "enum": ["arg0", "arg1"]}},
-                    "memory_reads": {"type": ["boolean", "null"]},
-                    "memory_writes": {"type": ["boolean", "null"]},
+                    "stack_memory_reads": {"type": ["boolean", "null"]},
+                    "stack_memory_writes": {"type": ["boolean", "null"]},
+                    "external_memory_reads": {"type": ["boolean", "null"]},
+                    "external_memory_writes": {"type": ["boolean", "null"]},
                     "direct_call_count": {"type": ["integer", "null"]},
+                    "indirect_call_count": {"type": ["integer", "null"]},
+                    "imported_call_count": {"type": ["integer", "null"]},
                     "evidence": {"type": "array", "items": {"type": "string"}},
                     "unknown_reason": {"type": ["string", "null"]},
                 },
-                "required": ["question_id", "status", "parameter_count", "category",
+                "required": ["question_id", "status", "parameter_count", "category", "control_shape",
                              "constants", "case_values", "return_dependencies",
-                             "memory_reads", "memory_writes", "direct_call_count",
+                             "stack_memory_reads", "stack_memory_writes",
+                             "external_memory_reads", "external_memory_writes",
+                             "direct_call_count", "indirect_call_count", "imported_call_count",
                              "evidence", "unknown_reason"]}},
     }, "required": ["answers"]}
 
@@ -56,10 +69,12 @@ def extract_sections(path: pathlib.Path) -> dict[str, str]:
 def objective_prompt(target_address: str) -> str:
     schema = canonical_json(OBJECTIVE_SCHEMA)
     return f"""Analyze the function at address {target_address}. Answer two objective questions.
-q1: What is its parameter count, broad purpose category, important integer constants,
-and recovered switch case values? Omit incidental stack offsets and addresses from constants.
-q2: Which arguments influence the return value, does it read or write memory, and how
-many direct call sites occur in the function? Use arg0 and arg1 for dependencies.
+q1: Choose its purpose category and control shape only from the schema enums, and report
+its parameter count, important integer constants, and recovered switch case values. Omit
+incidental stack offsets, dispatch-table offsets, and addresses from constants.
+q2: Which arguments influence the return value? Separately report stack-local and external
+memory reads/writes, and direct internal, indirect, and imported call-site counts. Use arg0
+and arg1 for dependencies. Dispatch-table reads are control machinery, not external memory.
 For every answered question include at least one function/instruction address or stable
 evidence identifier returned by a tool. Use status unknown and null/empty fields when the
 available evidence is insufficient. Return JSON matching this exact schema: {schema}
@@ -102,4 +117,3 @@ def validate_isolation(sections: dict[str, str], visible: str, track: str,
 def instructions(sections: dict[str, str], track: str, condition: str) -> str:
     return sections["common"] if track == "common" else \
         sections["common"] + "\n" + sections[condition]
-

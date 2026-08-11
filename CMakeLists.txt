@@ -167,6 +167,7 @@ configure_file(
     @ONLY)
 
 add_library(airece_core STATIC
+    src/emit/agent_json.cpp
     src/emit/semantic_json.cpp
     src/emit/semantic_text.cpp
     src/semantic/api_model.cpp

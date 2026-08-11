@@ -42,6 +42,7 @@ struct AnalysisOptions {
     std::uint32_t max_roots{};
     std::uint32_t max_indirect_candidates_per_edge{};
     std::uint32_t max_indirect_candidate_edges{};
+    std::vector<std::uint64_t> manual_roots;
     bool build_ir{true};
     bool expand_indirects{true};
     bool analyze_indirects{true};

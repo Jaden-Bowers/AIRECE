@@ -12,7 +12,9 @@
     "reasoning_control": "explicit-none",
     "reasoning": {"effort": "none"},
     "tool_transport": "json-protocol",
-    "max_protocol_request_bytes": 22000
+    "max_protocol_request_bytes": 22000,
+    "separate_final_generation": true,
+    "schema_constrained_final": false
   },
   "budgets": {
     "max_tool_calls": 6,
@@ -26,7 +28,7 @@
   },
   "paths": {
     "airece": "out/build/windows-msvc/Release/airece.exe",
-    "analyzer_report": "out/benchmark-analyzer-quick.json",
+    "analyzer_report": "out/benchmark-analyzer-agent.json",
     "ghidra_root": "C:/Users/Jaden/Desktop/Projects/IR/kb/ghidra_12.1.2_PUBLIC",
     "instruction_packs": "docs/benchmark-tool-instructions.md",
     "output_root": "out/ai-utility-benchmark"

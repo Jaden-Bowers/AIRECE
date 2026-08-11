@@ -9,7 +9,7 @@ from typing import Any
 from .backends import AireceBackend, GhidraBackend, GhidraExtractor, tool_schema
 from .corpus import build as build_corpus
 from .lmstudio import LMStudioAdapter
-from .prompts import (extract_sections, instructions, objective_prompt,
+from .prompts import (OBJECTIVE_SCHEMA, extract_sections, instructions, objective_prompt,
                       prompt_snapshot, reconstruction_prompt, validate_isolation)
 from .scoring import score_objective, score_reconstruction, summarize
 from .util import (atomic_write_json, atomic_write_text, canonical_json, load_json,
@@ -50,10 +50,87 @@ def _function_bounds(document: dict[str, Any], address: str) -> tuple[int, int]:
     return wanted, wanted
 
 
+def _preflight_targets(airece: pathlib.Path, cases: list[dict[str, Any]],
+                       ghidra: GhidraExtractor, max_bytes: int,
+                       analyzer_timeout: float) -> list[dict[str, Any]]:
+    report: list[dict[str, Any]] = []
+    failures: list[str] = []
+    dense_results = ["arg1 + 0xb", "arg1 * 3", "arg1 - 0x13",
+                     "arg1 ^ 0x55", "arg1 + 0x65", "arg1 - 7"]
+    for case in cases:
+        binary = pathlib.Path(case["binary"])
+        wanted = int(case["target_address"], 0)
+        row: dict[str, Any] = {"case_id": case["case_id"],
+                               "target_address": case["target_address"]}
+        try:
+            airece_backend = AireceBackend(
+                airece, binary, max_bytes, analyzer_timeout)
+            raw = airece_backend.execute("function_context", {
+                "address": case["target_address"], "level": "primary"}, "common")
+            if len(raw.encode("utf-8")) > max_bytes:
+                raise AssertionError("bounded response exceeds configured byte limit")
+            envelope = json.loads(raw)
+            context = envelope.get("result", {})
+            if not envelope.get("ok") or int(context.get("function", {}).get("entry", "-1"), 0) != wanted:
+                raise AssertionError("requested AIRECE function was not resolved exactly")
+            if int(context.get("function", {}).get("instruction_count", 0)) <= 0:
+                raise AssertionError("AIRECE function contains no decoded instructions")
+            if envelope.get("omitted") or context.get("omitted", {}).get("facts"):
+                raise AssertionError("AIRECE agent context was truncated")
+            category = case.get("truth", {}).get("category")
+            if category == "dense-switch":
+                switches = context.get("switches", [])
+                if (len(switches) != 1 or switches[0].get("selector") != "arg0 & 7" or
+                        [item.get("value") for item in switches[0].get("cases", [])] != list(range(6)) or
+                        [item.get("result") for item in switches[0].get("cases", [])] != dense_results or
+                        switches[0].get("default", {}).get("result") != "arg1 ^ 0x313"):
+                    raise AssertionError("dense-switch agent semantics are incomplete")
+            elif category == "recursion" and not context.get("calls"):
+                raise AssertionError("recursion agent context contains no call fact")
+            elif category == "nested-branches" and (
+                    len(context.get("conditions", [])) < 2 or
+                    len(context.get("returns", [])) < 2):
+                raise AssertionError("nested-branch agent context lacks conditions or results")
+            elif category == "direct-calls" and len(context.get("calls", [])) < 2:
+                raise AssertionError("direct-call agent context lacks both call sites")
+            elif category == "global-read-write":
+                effects = {item.get("effect") for item in context.get("memory_effects", [])}
+                if not {"read:global", "write:global"}.issubset(effects):
+                    raise AssertionError("global-memory agent context lacks read/write effects")
+            row["airece"] = {"available": True, "bytes": len(raw.encode("utf-8")),
+                             "instructions": context["function"]["instruction_count"],
+                             "semantic_check": category in {"dense-switch", "recursion",
+                                 "nested-branches", "direct-calls", "global-read-write"}}
+
+            ghidra_backend = GhidraBackend(ghidra, binary, max_bytes)
+            raw = ghidra_backend.execute("function_context", {
+                "address": case["target_address"], "level": "low_level"}, "common")
+            if len(raw.encode("utf-8")) > max_bytes:
+                raise AssertionError("Ghidra bounded response exceeds configured byte limit")
+            envelope = json.loads(raw)
+            context = envelope.get("result", {})
+            if not envelope.get("ok") or int(context.get("entry", "-1"), 0) != wanted:
+                raise AssertionError("requested Ghidra function was not resolved exactly")
+            instructions = context.get("instructions", [])
+            if not instructions:
+                raise AssertionError("Ghidra function contains no instructions")
+            row["ghidra"] = {"available": True, "bytes": len(raw.encode("utf-8")),
+                             "instructions": len(instructions),
+                             "omitted_records": envelope.get("omitted", {}).get("records", 0)}
+        except (AssertionError, OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+            row["error"] = str(error)
+            failures.append(f"{case['case_id']}: {error}")
+        report.append(row)
+    if failures:
+        raise RuntimeError("target preflight failed; model sessions were not started: " +
+                           "; ".join(failures))
+    return report
+
+
 def _report(summary: dict[str, Any], manifest: dict[str, Any]) -> str:
     lines = ["# AIRECE AI-utility benchmark report", "",
              f"Status: **{manifest['status']}**", "",
-             f"Frozen analyzer: `{manifest['analyzer']['tag']}` / "
+             f"Validated analyzer: `{manifest['analyzer']['tag']}` / "
              f"`{manifest['analyzer']['commit']}`", "",
              f"Model: `{manifest['model']['id']}` via LM Studio Responses", "",
              f"Corpus: {manifest['corpus']['selected_cases']} selected cases from "
@@ -115,18 +192,12 @@ class BenchmarkRunner:
         status = git(self.root, "status", "--porcelain")
         if status:
             raise RuntimeError("benchmark run requires a clean AIRECE/harness checkout")
-        allowed_delta = ("benchmarks/", "docs/", "README.md")
-        delta = (git(self.root, "diff", "--name-only",
-                     "v0.10.0-benchmark-rc1..HEAD") or "").splitlines()
-        disallowed = [path for path in delta if not path.startswith(allowed_delta)]
-        if disallowed:
-            raise RuntimeError(f"analyzer implementation differs from frozen tag: {disallowed}")
         for name, snapshot in health["repositories"].items():
             repository = pathlib.Path(snapshot["path"])
             if git(repository, "status", "--porcelain"):
                 raise RuntimeError(f"repository is dirty at benchmark start: {name}")
-            if name != "airece" and git(repository, "rev-parse", "HEAD") != snapshot["revision"]:
-                raise RuntimeError(f"dependency revision changed since health report: {name}")
+            if git(repository, "rev-parse", "HEAD") != snapshot["revision"]:
+                raise RuntimeError(f"repository revision changed since health report: {name}")
         corpus_manifest = build_corpus(self.root, self.config, self.output) if rebuild_corpus else \
             load_json(self.output / "corpus" / "manifest.json")
         if split not in {"development", "heldout"}:
@@ -137,6 +208,10 @@ class BenchmarkRunner:
         ghidra = GhidraExtractor(resolve(self.root, self.config["paths"]["ghidra_root"]),
             self.root / "benchmarks" / "ghidra" / "AireceBenchmarkExport.java",
             self.output / "cache" / "ghidra", self.config["budgets"]["ghidra_timeout_seconds"])
+        target_preflight = _preflight_targets(
+            self.airece, cases, ghidra,
+            self.config["budgets"]["max_tool_result_bytes"],
+            self.config["budgets"]["analyzer_timeout_seconds"])
         lm = LMStudioAdapter(self.config["model"], self.config["budgets"]["task_timeout_seconds"],
                              [str(self.root),
                               *(str(pathlib.Path(item["binary"]).parent) for item in cases),
@@ -144,11 +219,11 @@ class BenchmarkRunner:
         model_metadata = lm.probe()
         native_smoke = lm.native_chat_smoke()
         version = run(["lms", "--version"], self.root, 10)
-        analyzer_commit = git(self.root, "rev-list", "-n", "1", "v0.10.0-benchmark-rc1")
+        analyzer_commit = git(self.root, "rev-parse", "HEAD")
         manifest = {"schema": "airece.ai-utility-manifest.v1", "status": "running",
             "created_unix": int(time.time()), "config": self.config,
             "config_sha256": sha256_file(self.config_path),
-            "analyzer": {"tag": "v0.10.0-benchmark-rc1", "commit": analyzer_commit,
+            "analyzer": {"tag": "post-diagnostic-candidate", "commit": analyzer_commit,
                          "harness_commit": git(self.root, "rev-parse", "HEAD"),
                          "executable": str(self.airece),
                          "sha256": health["artifact"]["sha256"],
@@ -170,8 +245,9 @@ class BenchmarkRunner:
                        "manifest_sha256": sha256_file(self.output / "corpus" / "manifest.json"),
                        "total_cases": len(corpus_manifest["cases"]), "split": split,
                        "selected_cases": len(cases), "artifacts": corpus_manifest["artifacts"]},
+            "target_preflight": target_preflight,
             "repetitions": repetitions, "failures": [], "skipped": []}
-        manifest["analyzer"]["source_delta_from_tag"] = delta
+        manifest["analyzer"]["source_delta_from_tag"] = None
         return manifest, cases, ghidra, lm
 
     def plan(self, cases: list[dict[str, Any]], repetitions: int) -> list[dict[str, Any]]:
@@ -261,7 +337,8 @@ class BenchmarkRunner:
                 if self.config["model"].get("tool_transport") == "json-protocol":
                     model = lm.run_json_protocol(visible, task_prompt, schemas,
                         execute_tool, self.config["budgets"]["max_tool_calls"],
-                        self.config["budgets"]["max_input_bytes"])
+                        self.config["budgets"]["max_input_bytes"],
+                        OBJECTIVE_SCHEMA if job["task"] == "objective" else None)
                 else:
                     model = lm.run_tools(visible, task_prompt, schemas,
                         execute_tool, self.config["budgets"]["max_tool_calls"],

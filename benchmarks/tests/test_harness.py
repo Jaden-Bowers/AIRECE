@@ -5,7 +5,7 @@ import pathlib
 import tempfile
 import unittest
 
-from benchmarks.airece_bench.backends import tool_schema
+from benchmarks.airece_bench.backends import Backend, tool_schema
 from benchmarks.airece_bench.corpus import (FUNCTIONS, TEST_INPUTS, dense, direct_calls,
                                             indirect, local_array, nested, recursive,
                                             rotate, sparse, structure)
@@ -45,18 +45,39 @@ class PromptTests(unittest.TestCase):
                                "airece", ["case-secret"])
 
 
+class BackendTests(unittest.TestCase):
+    class Dummy(Backend):
+        def _execute(self, name, arguments, track):
+            return self._bounded({"ok": True, "result": list(range(100))})
+
+    def test_results_are_valid_bounded_json_and_duplicates_are_cached(self) -> None:
+        backend = self.Dummy(pathlib.Path("fixture.bin"), 256)
+        first = backend.execute("inspect", {}, "common")
+        self.assertLessEqual(len(first.encode("utf-8")), 256)
+        value = json.loads(first)
+        self.assertGreater(value["omitted"]["records"], 0)
+        duplicate = json.loads(backend.execute("inspect", {}, "common"))
+        self.assertEqual(duplicate, {"ok": True, "same_result_as_call": 1})
+
+
 class ParserScoringTests(unittest.TestCase):
     def test_json_extraction_and_schema(self) -> None:
         answer = {"answers": [
             {"question_id": "q1", "status": "answered", "parameter_count": 2,
-             "category": "bit-manipulation", "constants": [31, 0xa5a5a5a5],
-             "case_values": [], "return_dependencies": [], "memory_reads": None,
-             "memory_writes": None, "direct_call_count": None,
+             "category": "bit-manipulation", "constants": [31, -1515870811],
+             "control_shape": "straight-line", "case_values": [],
+             "return_dependencies": [], "stack_memory_reads": None,
+             "stack_memory_writes": None, "external_memory_reads": None,
+             "external_memory_writes": None, "direct_call_count": None,
+             "indirect_call_count": None, "imported_call_count": None,
              "evidence": ["0x1000"], "unknown_reason": None},
             {"question_id": "q2", "status": "answered", "parameter_count": None,
              "category": None, "constants": [], "case_values": [],
-             "return_dependencies": ["arg0", "arg1"], "memory_reads": False,
-             "memory_writes": False, "direct_call_count": 0,
+             "control_shape": None, "return_dependencies": ["arg0", "arg1"],
+             "stack_memory_reads": False, "stack_memory_writes": False,
+             "external_memory_reads": False, "external_memory_writes": False,
+             "direct_call_count": 0, "indirect_call_count": 0,
+             "imported_call_count": 0,
              "evidence": ["0x1001"], "unknown_reason": None}]}
         parsed, error = extract_json("```json\n" + json.dumps(answer) + "\n```")
         self.assertIsNone(error)
@@ -64,10 +85,27 @@ class ParserScoringTests(unittest.TestCase):
         truth = {key: value for key, value in FUNCTIONS["f_19a7d3e1"].items()
                  if key not in {"source", "oracle"}}
         truth["parameter_count"] = 2
+        truth.update({"control_shape": "straight-line",
+            "stack_memory_reads": False, "stack_memory_writes": False,
+            "external_memory_reads": False, "external_memory_writes": False,
+            "indirect_call_count": 0, "imported_call_count": 0})
+        truth.pop("memory_reads")
+        truth.pop("memory_writes")
         score = score_objective(json.dumps(answer), truth,
             [{"result": "addresses 0x1000 and 0x1001"}], 0x1000, 0x1010)
-        self.assertEqual(score["fields_correct"], score["fields_total"])
+        # An empty no-switch set is not awarded as a recovered semantic fact.
+        self.assertEqual(score["fields_correct"], score["fields_total"] - 1)
         self.assertEqual(score["evidence_valid"], 2)
+
+        unknown = json.loads(json.dumps(answer))
+        unknown["answers"][0]["status"] = "unknown"
+        unknown_score = score_objective(json.dumps(unknown), truth, [], 0x1000, 0x1010)
+        self.assertFalse(unknown_score["field_details"]["parameter_count"]["exact"])
+        self.assertEqual(unknown_score["field_details"]["constants"]["f1"], 1.0)
+        self.assertFalse(unknown_score["field_details"]["constants"]["exact"])
+
+        malformed = {"answers": [{"question_id": "q1"}]}
+        self.assertTrue(validate_objective(malformed))
 
     def test_source_extraction(self) -> None:
         function, error = extract_c_function(

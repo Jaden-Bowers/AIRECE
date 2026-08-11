@@ -12,9 +12,11 @@ from .prompts import OBJECTIVE_SCHEMA
 from .util import run
 
 
-OBJECTIVE_FIELDS = ("parameter_count", "category", "constants", "case_values",
-                    "return_dependencies", "memory_reads", "memory_writes",
-                    "direct_call_count")
+OBJECTIVE_FIELDS = ("parameter_count", "category", "control_shape", "constants",
+                    "case_values", "return_dependencies", "stack_memory_reads",
+                    "stack_memory_writes", "external_memory_reads",
+                    "external_memory_writes", "direct_call_count",
+                    "indirect_call_count", "imported_call_count")
 SET_FIELDS = {"constants", "case_values", "return_dependencies"}
 
 
@@ -63,6 +65,9 @@ def _evidence_valid(locator: str, transcript: str,
                     address_start: int, address_end: int) -> bool:
     if re.fullmatch(r"F[0-9a-fA-F]+:(?:S|E):[^\s]+", locator):
         return locator in transcript
+    if re.fullmatch(r"A:0x[0-9a-fA-F]+-0x[0-9a-fA-F]+", locator):
+        start = int(locator.split(":", 1)[1].split("-", 1)[0], 0)
+        return address_start <= start <= address_end and locator in transcript
     try:
         address = int(locator, 0)
         return address_start <= address <= address_end and locator.lower() in transcript.lower()
@@ -82,39 +87,46 @@ def score_objective(text: str, truth: dict[str, Any], tool_events: list[dict[str
     errors = validate_objective(value)
     answers = {item.get("question_id"): item for item in value.get("answers", [])
                if isinstance(item, dict)}
-    q1_fields = {"parameter_count", "category", "constants", "case_values"}
+    q1_fields = {"parameter_count", "category", "control_shape", "constants", "case_values"}
     merged = {field: answers.get("q1" if field in q1_fields else "q2", {}).get(field)
               for field in OBJECTIVE_FIELDS}
     correct = 0
     unsupported = 0
     claims = 0
     unknown = 0
+    semantic_points = 0.0
     field_details: dict[str, Any] = {}
     for field in OBJECTIVE_FIELDS:
         actual = merged.get(field)
         expected = truth[field]
-        is_unknown = actual is None or actual == []
+        answer = answers.get("q1" if field in q1_fields else "q2", {})
+        is_unknown = answer.get("status") == "unknown" or actual is None or actual == []
         if is_unknown:
             unknown += 1
         if field in SET_FIELDS:
-            actual_set, expected_set = set(actual or []), set(expected)
+            normalize = (lambda item: item & 0xffffffff) if field in {"constants", "case_values"} \
+                else (lambda item: item)
+            actual_set = {normalize(item) for item in (actual or [])}
+            expected_set = {normalize(item) for item in expected}
             intersection = len(actual_set & expected_set)
             precision = intersection / len(actual_set) if actual_set else (1.0 if not expected_set else 0.0)
             recall = intersection / len(expected_set) if expected_set else (1.0 if not actual_set else 0.0)
             f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-            exact = actual_set == expected_set
+            exact = actual_set == expected_set and not is_unknown
             unsupported += len(actual_set - expected_set)
             claims += len(actual_set)
             field_details[field] = {"exact": exact, "precision": precision,
                                     "recall": recall, "f1": f1,
                                     "actual": sorted(actual_set, key=str),
                                     "expected": sorted(expected_set, key=str)}
+            semantic_points += 0.0 if is_unknown else f1
         else:
-            exact = actual == expected
+            exact = actual == expected and not is_unknown
             if actual is not None:
                 claims += 1
                 unsupported += 0 if exact else 1
             field_details[field] = {"exact": exact, "actual": actual, "expected": expected}
+            semantic_points += float(exact)
         correct += int(exact)
     transcript = "\n".join(str(event.get("result", "")) for event in tool_events)
     evidence = [item for answer in answers.values() for item in answer.get("evidence", [])
@@ -123,7 +135,9 @@ def score_objective(text: str, truth: dict[str, Any], tool_events: list[dict[str
                          for item in evidence)
     return {"schema_valid": not errors, "schema_errors": errors,
             "fields_correct": correct, "fields_total": len(OBJECTIVE_FIELDS),
-            "accuracy": correct / len(OBJECTIVE_FIELDS), "field_details": field_details,
+            "accuracy": semantic_points / len(OBJECTIVE_FIELDS),
+            "semantic_accuracy": semantic_points / len(OBJECTIVE_FIELDS),
+            "field_details": field_details,
             "unsupported_claims": unsupported, "claims": claims,
             "unsupported_claim_rate": unsupported / claims if claims else 0.0,
             "unknown_fields": unknown, "unknown_rate": unknown / len(OBJECTIVE_FIELDS),
@@ -249,6 +263,12 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
                  "output_tokens": sum(item.get("model", {}).get("usage", {}).get("output_tokens", 0) for item in items),
                  "total_tokens": sum(item.get("model", {}).get("usage", {}).get("total_tokens", 0) for item in items),
                  "tool_calls": sum(len(item.get("model", {}).get("tool_events", [])) for item in items),
+                 "protocol_clean": sum(
+                    item.get("model", {}).get("protocol_compliance", {}).get("errors", 0) == 0 and
+                    item.get("model", {}).get("protocol_compliance", {}).get("recoveries", 0) == 0
+                    for item in items if item.get("model")),
+                 "transcript_compactions": sum(len(request.get("_transcript_compactions", []))
+                    for item in items for request in item.get("model", {}).get("requests", [])),
                  "transport_retries": sum(max(0, int(request.get("_transport_attempts", 1)) - 1)
                     for item in items for request in item.get("model", {}).get("requests", [])),
                  "analysis_ms": round(sum(analysis_ms(item) for item in items), 3),
@@ -268,6 +288,7 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
                     "f1_mean": sum(float(item.get("f1", item.get("exact", False)))
                                    for item in details) / len(details) if details else 0.0}
             group.update({"fields_correct": sum(item.get("fields_correct", 0) for item in scores),
+                          "schema_valid": sum(bool(item.get("schema_valid")) for item in scores),
                           "fields_total": sum(item.get("fields_total", 0) for item in scores),
                           "evidence_valid": sum(item.get("evidence_valid", 0) for item in scores),
                           "evidence_total": sum(item.get("evidence_total", 0) for item in scores),
@@ -283,6 +304,10 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
         group["rates"] = {
             "objective_accuracy": group.get("fields_correct", 0) / group.get("fields_total", 1)
                 if task == "objective" and group.get("fields_total", 0) else 0.0,
+            "schema_validity": group.get("schema_valid", 0) / group["runs"]
+                if task == "objective" and group["runs"] else None,
+            "protocol_compliance": group.get("protocol_clean", 0) / group["runs"]
+                if group["runs"] else 0.0,
             "evidence_validity": group.get("evidence_valid", 0) / group.get("evidence_total", 1)
                 if task == "objective" and group.get("evidence_total", 0) else 0.0,
             "unsupported_claim": group.get("unsupported_claims", 0) / group.get("claims", 1)

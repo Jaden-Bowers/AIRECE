@@ -64,6 +64,19 @@ AIRECE_EXPORT int airece_semantic_dense_switch(unsigned value) {
     }
 }
 
+AIRECE_EXPORT uint32_t airece_semantic_agent_dense_switch(
+    uint32_t selector, uint32_t value) {
+    switch (selector & 7U) {
+    case 0: return value + 11U;
+    case 1: return value * 3U;
+    case 2: return value - 19U;
+    case 3: return value ^ 0x55U;
+    case 4: return value + 101U;
+    case 5: return value - 7U;
+    default: return value ^ 0x313U;
+    }
+}
+
 AIRECE_EXPORT int airece_semantic_loop(const int* values, unsigned count) {
     int sum = 0;
     unsigned index = 0;
