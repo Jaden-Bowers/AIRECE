@@ -86,6 +86,37 @@ out/build/windows-msvc/Release/airece.exe evidence sample.exe F140001000:S:O16
 python tools/evaluate.py --airece out/build/windows-msvc/Release/airece.exe --manifest C:/path/to/corpus-manifest.json --max-samples 20 --functions-per-binary 5 --output out/evaluation.json
 ```
 
+## Quick analyzer benchmark
+
+The frozen first benchmark target is documented in `BENCHMARK_FREEZE.md` and
+identified by `v0.10.0-benchmark-rc1`. `tools/benchmark_analyzer.py` wraps the
+semantic evaluator with release-artifact metadata, repository-cleanliness and
+revision checks, a fast correctness-focused CTest subset, explicit coverage
+gates, and one machine-readable report. It is intentionally bounded; it is a
+release-candidate health measurement, not a long-running model benchmark.
+
+```powershell
+python tools/benchmark_analyzer.py `
+  --airece out/build/windows-msvc/Release/airece.exe `
+  --build-dir out/build/windows-msvc `
+  --manifest C:/path/to/corpus-manifest.json `
+  --assemblage C:/path/to/Assemblage_PE/binaries.tar.xz `
+  --compiler-samples 10 --assemblage-samples 10 --functions-per-binary 5 `
+  --output out/benchmark-analyzer-quick.json
+```
+
+The default gates require all sampled binaries to pass the semantic invariants,
+at least 95% frequency-weighted exact instruction coverage, at least 90% exact
+block coverage, a Release artifact, exact component revisions, and clean source
+trees. Larger AI/Ghidra comparisons should consume the frozen executable and
+record its SHA-256 from this report.
+
+The complete handoff prompt for building the paired local-model/Ghidra harness
+is in `docs/benchmark-agent-prompt.md`. It keeps the analyzer tag immutable,
+uses behavioral and structured fact oracles instead of an LLM judge, isolates
+question-answering from source reconstruction, and requires paired token and
+accuracy measurements.
+
 The AIRECE build disables XAIR's bootstrap decoder and CFG's `fast-x86` and
 `zydis-mini` compatibility decoders. It exposes no decoder-selection CLI flag.
 

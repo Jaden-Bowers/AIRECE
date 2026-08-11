@@ -37,3 +37,10 @@ builds CRT-free MSVC `/Od` and `/O2` fixtures from
 available it builds equivalent Clang O0/O2 fixtures in a temporary directory.
 Both Debug and Release configurations check load/store identity, return,
 branch, loop, ordering, and switch contracts against real compiler output.
+
+For a benchmark-freeze health report, use `tools/benchmark_analyzer.py`. It
+invokes this evaluator for compiler and/or Assemblage inputs, runs only the
+fast correctness-focused tests, records the executable hash and exact Git
+revisions, and applies explicit release gates. The detailed per-function
+evaluation data remains embedded in the resulting
+`airece.analyzer-benchmark.v1` JSON document.

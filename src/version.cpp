@@ -15,6 +15,7 @@ namespace airece {
 std::string version_text() {
     std::ostringstream output;
     output << "AIRECE " << AIRECE_VERSION << '\n'
+           << "benchmark-freeze " << AIRECE_BENCHMARK_FREEZE << '\n'
            << "xair " << xair_ir_version_string() << " ("
            << AIRECE_XAIR_REVISION << ")\n"
            << "xair_cfg " << AIRECE_XAIR_CFG_VERSION << " ("

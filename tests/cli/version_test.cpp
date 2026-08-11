@@ -6,6 +6,8 @@
 int main() {
     const std::string version = airece::version_text();
     assert(version.find("AIRECE 0.10.0") != std::string::npos);
+    assert(version.find("benchmark-freeze v0.10.0-benchmark-rc1") !=
+        std::string::npos);
     assert(version.find("xair 0.3.0") != std::string::npos);
     assert(version.find("xair_cfg 0.2.0") != std::string::npos);
     assert(version.find("xair_sym 0.6.0") != std::string::npos);
