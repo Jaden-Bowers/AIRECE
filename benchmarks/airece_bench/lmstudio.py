@@ -268,12 +268,7 @@ class LMStudioAdapter:
         protocol_errors: list[str] = []
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
                  "reasoning_tokens": 0, "cached_tokens": 0}
-        payload: dict[str, Any] = {"model": self.config["id"],
-            "instructions": full_instructions, "input": user_input,
-            "temperature": self.config["temperature"], "seed": self.config["seed"],
-            "max_output_tokens": self.config["max_output_tokens"], "store": True}
-        if self.config.get("reasoning") is not None:
-            payload["reasoning"] = self.config["reasoning"]
+        transcript: list[dict[str, Any]] = []
         started = time.perf_counter()
         total_model_ms = 0.0
         executed_calls = 0
@@ -282,6 +277,14 @@ class LMStudioAdapter:
             turns += 1
             if turns > max_tool_calls + 3:
                 raise LMStudioError("JSON protocol turn budget exhausted")
+            envelope = {"task": user_input, "transcript": transcript,
+                        "remaining_tool_calls": max_tool_calls - executed_calls}
+            payload: dict[str, Any] = {"model": self.config["id"],
+                "instructions": full_instructions, "input": canonical_json(envelope),
+                "temperature": self.config["temperature"], "seed": self.config["seed"],
+                "max_output_tokens": self.config["max_output_tokens"], "store": False}
+            if self.config.get("reasoning") is not None:
+                payload["reasoning"] = self.config["reasoning"]
             payload_bytes = len(canonical_json(payload).encode("utf-8"))
             if payload_bytes > max_input_bytes:
                 raise LMStudioError(
@@ -314,6 +317,7 @@ class LMStudioAdapter:
                 next_input: dict[str, Any] = {"protocol_error": message,
                     "required": {"action": "tool or final"},
                     "remaining_tool_calls": max_tool_calls - executed_calls}
+                transcript.append({"assistant_output": raw, "controller": next_input})
             elif value["action"] == "final":
                 content = value.get("content")
                 final = content if isinstance(content, str) else canonical_json(content)
@@ -349,9 +353,4 @@ class LMStudioAdapter:
                     "instruction": "Return the next strict JSON protocol object."}
                 if executed_calls >= max_tool_calls:
                     next_input["instruction"] = "Tool budget is exhausted. Return action final now."
-            payload = {"model": self.config["id"],
-                "previous_response_id": response["id"], "input": canonical_json(next_input),
-                "temperature": self.config["temperature"], "seed": self.config["seed"],
-                "max_output_tokens": self.config["max_output_tokens"], "store": True}
-            if self.config.get("reasoning") is not None:
-                payload["reasoning"] = self.config["reasoning"]
+                transcript.append({"assistant": value, "controller": next_input})

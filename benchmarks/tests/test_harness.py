@@ -168,6 +168,10 @@ class ToolBudgetTests(unittest.TestCase):
         self.assertEqual(result["final_text"], "OK")
         self.assertEqual(result["transport"], "json-protocol")
         self.assertEqual(result["tool_events"][0]["name"], "echo")
+        self.assertNotIn("previous_response_id", result["requests"][1])
+        self.assertFalse(result["requests"][1]["store"])
+        second_envelope = json.loads(result["requests"][1]["input"])
+        self.assertEqual(second_envelope["transcript"][0]["assistant"]["name"], "echo")
 
 
 if __name__ == "__main__":
