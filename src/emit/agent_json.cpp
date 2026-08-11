@@ -250,6 +250,12 @@ struct NodeResult {
     std::string index_expression;
 };
 
+struct PathState {
+    xair_cfg_node_id node{XAIR_CFG_INVALID_ID};
+    State state;
+    std::unordered_set<xair_cfg_node_id> visited;
+};
+
 NodeResult interpret_node(
     const xair_binary_view& binary,
     const xair_cfg_node& node,
@@ -601,6 +607,38 @@ std::string render_agent_json(
             }
         }
     }
+
+    // Reinterpret branch paths independently so fixed stack slots retain their
+    // path-specific values at shared return blocks. The ordinary traversal above
+    // intentionally visits a CFG node once; that is useful for a stable digest but
+    // would otherwise collapse O0 diamonds onto whichever predecessor arrived first.
+    std::deque<PathState> paths;
+    paths.push_back({semantic.control.entry, initial_state(), {}});
+    std::size_t explored_paths = 0;
+    while (!paths.empty() && explored_paths < 1024) {
+        PathState path = std::move(paths.front());
+        paths.pop_front();
+        if (path.node == XAIR_CFG_INVALID_ID || !path.visited.insert(path.node).second) {
+            continue;
+        }
+        const xair_cfg_node* node = xair_cfg_get_node(&session.cfg(), path.node);
+        if (node == nullptr) continue;
+        ++explored_paths;
+        NodeResult result = interpret_node(session.binary(), *node, std::move(path.state),
+            digest, switch_headers.contains(path.node));
+        if (!result.return_expression.empty()) {
+            append_unique(digest.returns, {result.return_expression,
+                evidence_id(node->start, node->end)});
+            continue;
+        }
+        std::unordered_set<xair_cfg_node_id> queued;
+        for (const xair_cfg_node_id successor : successors[path.node]) {
+            if (queued.insert(successor).second) {
+                paths.push_back({successor, result.state, path.visited});
+            }
+        }
+    }
+    if (!paths.empty()) ++digest.unresolved;
     for (const ControlRegion& region : semantic.control.regions) {
         if (region.kind != ControlRegionKind::switch_region) continue;
         SwitchFact fact;

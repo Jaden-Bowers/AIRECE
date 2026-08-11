@@ -232,6 +232,18 @@ def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
             if agent.get("memory_effects") or "trap" in raw_agent.lower():
                 raise AssertionError(f"agent view leaked dispatch machinery: {agent}")
 
+        if name == "airece_semantic_branch" and not optimized:
+            branch_agent = json.loads(run(
+                airece, "fn", str(fixture), address, "--view", "agent",
+                "--profile", "balanced", "--max-bytes", "4096",
+                "--max-statements", "128", "--max-evidence", "128",
+            ))
+            branch_returns = branch_agent.get("returns", [])
+            if len(branch_returns) < 2 or not all(
+                    "arg0" in item.get("expression", "") for item in branch_returns):
+                raise AssertionError(
+                    f"agent view collapsed path-specific branch returns: {branch_returns}")
+
         pseudo = run(
             airece, "fn", str(fixture), address, "--view", "pseudo",
             "--profile", "fast", "--max-bytes", "65536",
