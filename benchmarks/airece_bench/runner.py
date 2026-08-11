@@ -24,10 +24,13 @@ def git(root: pathlib.Path, *arguments: str) -> str | None:
     return result["stdout"].strip() if result["exit"] == 0 else None
 
 
-def _records(output: pathlib.Path) -> list[dict[str, Any]]:
+def _records(output: pathlib.Path, config_fingerprint: str | None = None) -> list[dict[str, Any]]:
     records = []
     for path in sorted((output / "records").glob("*.json")) if (output / "records").is_dir() else []:
-        try: records.append(load_json(path))
+        try:
+            record = load_json(path)
+            if config_fingerprint is None or record.get("config_fingerprint") == config_fingerprint:
+                records.append(record)
         except (OSError, json.JSONDecodeError): continue
     return records
 
@@ -220,6 +223,7 @@ class BenchmarkRunner:
                 continue
             binary = pathlib.Path(case["binary"])
             record: dict[str, Any] = {"schema": "airece.ai-utility-run.v1", "run_id": run_id,
+                "config_fingerprint": config_fingerprint,
                 **{key: job[key] for key in ("case_id", "repetition", "track", "task",
                                              "condition", "condition_order")},
                 "binary_sha256": case["binary_sha256"],
@@ -258,8 +262,8 @@ class BenchmarkRunner:
                 record["failure"] = {"type": type(error).__name__, "message": str(error)}
             record["end_to_end_ms"] = round((time.perf_counter() - run_started) * 1000, 3)
             atomic_write_json(record_path, record)
-            rebuild_jsonl(self.output, _records(self.output))
-        records = _records(self.output)
+            rebuild_jsonl(self.output, _records(self.output, config_fingerprint))
+        records = _records(self.output, config_fingerprint)
         summary = summarize(records)
         atomic_write_json(self.output / "summary.json", summary)
         failures = [{"run_id": item["run_id"], **item["failure"]}

@@ -48,10 +48,14 @@ class LMStudioAdapter:
             headers={"Content-Type": "application/json"})
         started = time.perf_counter()
         last_error: Exception | None = None
+        request_budget = timeout or self.timeout
         for attempt in range(1, 3):
             self.last_request_attempts = attempt
+            remaining_budget = request_budget - (time.perf_counter() - started)
+            if remaining_budget <= 0:
+                raise LMStudioError("LM Studio request timed out")
             try:
-                with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
+                with urllib.request.urlopen(request, timeout=remaining_budget) as response:
                     raw = response.read().decode("utf-8", "replace")
                     return json.loads(raw), dict(response.headers), \
                         round((time.perf_counter() - started) * 1000, 3)
@@ -128,9 +132,16 @@ class LMStudioAdapter:
             "max_output_tokens": self.config["max_output_tokens"],
             "max_tool_calls": max_tool_calls, "parallel_tool_calls": False,
             "store": True}
+        if self.config.get("reasoning") is not None:
+            payload["reasoning"] = self.config["reasoning"]
         started = time.perf_counter()
         total_model_ms = 0.0
+        executed_calls = 0
+        response_turns = 0
         while True:
+            response_turns += 1
+            if response_turns > max_tool_calls + 2:
+                raise LMStudioError("response-turn budget exhausted")
             payload_bytes = len(canonical_json(payload).encode("utf-8"))
             if payload_bytes > max_input_bytes:
                 raise LMStudioError(
@@ -167,8 +178,11 @@ class LMStudioAdapter:
                         "final_size": text_size(final), "response_headers": self._sanitize(headers)}
             outputs: list[dict[str, Any]] = []
             for call in calls:
-                if len(tool_events) >= max_tool_calls:
+                arguments: dict[str, Any] = {}
+                if executed_calls >= max_tool_calls:
                     result = canonical_json({"ok": False, "error": "tool-call budget exhausted"})
+                    tool_events.append({"name": call.get("name"), "arguments": {},
+                        "executed": False, "result": result, "result_size": text_size(result)})
                 else:
                     try:
                         arguments = json.loads(call.get("arguments") or "{}")
@@ -180,14 +194,23 @@ class LMStudioAdapter:
                         result = canonical_json({"ok": False,
                             "error": f"malformed tool request: {error}"})
                     tool_events.append({"name": call.get("name"),
-                        "arguments": self._sanitize(arguments), "result": self._sanitize(result),
+                        "arguments": self._sanitize(arguments), "executed": True,
+                        "result": self._sanitize(result),
                         "result_size": text_size(result)})
+                    executed_calls += 1
                 outputs.append({"type": "function_call_output",
                                 "call_id": call["call_id"], "output": result})
+            exhausted = executed_calls >= max_tool_calls
             payload = {"model": self.config["id"],
                 "previous_response_id": response["id"], "input": outputs,
-                "tools": tools, "tool_choice": "auto",
                 "temperature": self.config["temperature"], "seed": self.config["seed"],
                 "max_output_tokens": self.config["max_output_tokens"],
-                "max_tool_calls": max_tool_calls - len(tool_events),
-                "parallel_tool_calls": False, "store": True}
+                "store": True}
+            # LM Studio persists the original tool definitions with the response.
+            # Resending them on a stateful follow-up duplicates the tool-template
+            # context and can exceed even an otherwise adequate context window.
+            if exhausted:
+                payload["tools"] = []
+                payload["tool_choice"] = "none"
+            if self.config.get("reasoning") is not None:
+                payload["reasoning"] = self.config["reasoning"]

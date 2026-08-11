@@ -11,6 +11,7 @@ from benchmarks.airece_bench.corpus import (FUNCTIONS, TEST_INPUTS, dense, direc
                                             rotate, sparse, structure)
 from benchmarks.airece_bench.prompts import (extract_sections, instructions,
                                              validate_isolation)
+from benchmarks.airece_bench.lmstudio import LMStudioAdapter
 from benchmarks.airece_bench.runner import _records, rebuild_jsonl
 from benchmarks.airece_bench.scoring import (extract_c_function, extract_json,
                                              score_objective, validate_objective)
@@ -102,6 +103,27 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual([item["run_id"] for item in lines], ["a", "b"])
 
 
+class ToolBudgetTests(unittest.TestCase):
+    def test_exhausted_budget_forces_final_turn(self) -> None:
+        adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
+            "responses_path": "/v1/responses", "native_chat_path": "/api/v1/chat",
+            "temperature": 0, "seed": 1, "max_output_tokens": 32}, 10)
+        adapter.base_url = "http://unused"
+        responses = iter([
+            {"id": "one", "status": "completed", "usage": {}, "output": [
+                {"type": "function_call", "call_id": "call-one", "name": "echo",
+                 "arguments": "{}"}]},
+            {"id": "two", "status": "completed", "usage": {}, "output": [
+                {"type": "message", "content": [
+                    {"type": "output_text", "text": "done"}]}]},
+        ])
+        adapter._request = lambda *args, **kwargs: (next(responses), {}, 1.0)  # type: ignore[method-assign]
+        result = adapter.run_tools("instructions", "input", [],
+                                   lambda name, args: "{}", 1, 10000)
+        self.assertEqual(result["final_text"], "done")
+        self.assertEqual(result["requests"][1]["tool_choice"], "none")
+        self.assertEqual(len(result["tool_events"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
-
