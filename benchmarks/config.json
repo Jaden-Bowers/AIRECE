@@ -7,6 +7,7 @@
     "native_chat_path": "/api/v1/chat",
     "temperature": 0,
     "seed": 424242,
+    "context_length": 16384,
     "max_output_tokens": 1024,
     "reasoning_control": "explicit-none",
     "reasoning": {"effort": "none"},

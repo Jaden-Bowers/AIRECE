@@ -5,6 +5,9 @@ and Ghidra 12.1.2 headless. It implements blinded common-capability and matched
 native-agent tracks, objective JSON scoring, source reconstruction with hidden
 behavioral tests, atomic resumable records, and paired bootstrap intervals.
 
+Load `prism-ml/bonsai-27b` in LM Studio with the checked-in 16,384-token context
+length before running. The benchmark preflight records the native model metadata.
+
 Generated binaries, Ghidra projects/cache, transcripts, and reports live under
 `out/ai-utility-benchmark` and are ignored by Git. Corpus source and answer
 oracles are controller-only: no source path, opaque symbol, case ID, expected

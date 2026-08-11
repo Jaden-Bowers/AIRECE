@@ -104,9 +104,19 @@ class LMStudioAdapter:
                 native, headers, elapsed = self._request("GET", "/api/v1/models", timeout=5)
                 match = next((item for item in native.get("models", [])
                               if item.get("key") == required), None)
+                loaded = (match or {}).get("loaded_instances", [])
+                required_context = self.config.get("context_length")
+                matching_instances = [instance for instance in loaded
+                    if (required_context is None or
+                        instance.get("config", {}).get("context_length") == required_context)]
+                if not matching_instances:
+                    errors.append(
+                        f"{candidate}: required model is not loaded at context {required_context}")
+                    continue
                 self.model_metadata = {"selected_base_url": self.base_url,
                     "required_model": required, "openai_model_ids": identifiers,
-                    "native_model": match, "response_headers": self._sanitize(headers),
+                    "native_model": match, "matching_loaded_instances": matching_instances,
+                    "response_headers": self._sanitize(headers),
                     "probe_elapsed_ms": elapsed, "transport_attempts": self.last_request_attempts}
                 return self.model_metadata
             except LMStudioError as error:
@@ -361,6 +371,10 @@ request another tool.
                 raise LMStudioError(f"JSON protocol response failed: {response.get('error')}")
             raw = self._text(response)
             value = self._protocol_object(raw)
+            if raw.strip() and (value is None or value.get("action") not in {"tool", "final"}):
+                protocol_recoveries.append(
+                    "accepted non-protocol model output as final")
+                return finish(raw.strip(), headers)
             if executed_calls >= max_tool_calls and (value is None or value.get("action") != "final"):
                 protocol_recoveries.append(
                     "accepted raw final after tool budget exhaustion")

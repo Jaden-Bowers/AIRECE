@@ -238,6 +238,22 @@ class ToolBudgetTests(unittest.TestCase):
         self.assertEqual(len(compactions), 1)
         self.assertEqual(compactions[0]["utf8_bytes"], 5000)
 
+    def test_json_protocol_accepts_implicit_final(self) -> None:
+        adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
+            "responses_path": "/v1/responses", "native_chat_path": "/api/v1/chat",
+            "temperature": 0, "seed": 1, "max_output_tokens": 32}, 10)
+        adapter.base_url = "http://unused"
+        response = {"id": "one", "status": "completed", "usage": {}, "output": [{
+            "type": "message", "content": [{"type": "output_text",
+                "text": "uint32_t target(uint32_t a, uint32_t b) { return a + b; }"}]}]}
+        adapter._request = lambda *args, **kwargs: (response, {}, 1.0)  # type: ignore[method-assign]
+        result = adapter.run_json_protocol(
+            "instructions", "input", [{"name": "echo", "parameters": {}}],
+            lambda name, args: "{}", 1, 10000)
+        self.assertIn("uint32_t target", result["final_text"])
+        self.assertEqual(result["protocol_recoveries"],
+                         ["accepted non-protocol model output as final"])
+
 
 if __name__ == "__main__":
     unittest.main()
