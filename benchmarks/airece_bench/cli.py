@@ -18,6 +18,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Run only the selected track; may be repeated")
     parser.add_argument("--category", action="append",
                         help="Select one deterministic case from each named category; may repeat")
+    parser.add_argument("--task", action="append", choices=("objective", "reconstruction"),
+                        help="Run only the selected task; may be repeated")
     parser.add_argument("--output-root",
                         help="Override paths.output_root without editing the config")
     parser.add_argument("--no-rebuild-corpus", action="store_true")
@@ -36,6 +38,8 @@ def main(argv: list[str] | None = None) -> int:
         runner.config["tracks"] = arguments.track
     if arguments.category:
         runner.config["selection_categories"] = arguments.category
+    if arguments.task:
+        runner.config["selection_tasks"] = arguments.task
     if arguments.output_root:
         runner.config["paths"]["output_root"] = arguments.output_root
         runner.output = (root / arguments.output_root).resolve()

@@ -334,10 +334,11 @@ class BenchmarkRunner:
     def plan(self, cases: list[dict[str, Any]], repetitions: int) -> list[dict[str, Any]]:
         jobs: list[dict[str, Any]] = []
         rng = random.Random(self.config["corpus"]["seed"])
+        selected_tasks = self.config.get("selection_tasks", ["objective", "reconstruction"])
         for case in cases:
             for repetition in range(repetitions):
                 for track in self.config["tracks"]:
-                    for task in ("objective", "reconstruction"):
+                    for task in selected_tasks:
                         if task not in case.get("tasks", ["objective", "reconstruction"]):
                             continue
                         conditions = list(self.config["conditions"])
