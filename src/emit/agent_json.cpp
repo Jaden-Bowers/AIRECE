@@ -269,14 +269,14 @@ std::string condition_token(const xair_x86_condition condition) {
     switch (condition) {
     case XAIR_X86_COND_E: return "==";
     case XAIR_X86_COND_NE: return "!=";
-    case XAIR_X86_COND_B: return "<u";
-    case XAIR_X86_COND_AE: return ">=u";
-    case XAIR_X86_COND_BE: return "<=u";
-    case XAIR_X86_COND_A: return ">u";
-    case XAIR_X86_COND_L: return "<s";
-    case XAIR_X86_COND_GE: return ">=s";
-    case XAIR_X86_COND_LE: return "<=s";
-    case XAIR_X86_COND_G: return ">s";
+    case XAIR_X86_COND_B:
+    case XAIR_X86_COND_L: return "<";
+    case XAIR_X86_COND_AE:
+    case XAIR_X86_COND_GE: return ">=";
+    case XAIR_X86_COND_BE:
+    case XAIR_X86_COND_LE: return "<=";
+    case XAIR_X86_COND_A:
+    case XAIR_X86_COND_G: return ">";
     case XAIR_X86_COND_S: return "sign";
     case XAIR_X86_COND_NS: return "not-sign";
     default: return "condition";
@@ -608,7 +608,7 @@ NodeResult interpret_node(
             break;
         case XAIR_X86_MNEMONIC_JCC:
             if (!compare_left.empty()) {
-                result.branch_condition = compare_left + ' ' +
+                result.branch_condition = grouped(compare_left) + ' ' +
                     condition_token(instruction.condition) + ' ' + compare_right;
                 append_unique(digest.conditions, {result.branch_condition, evidence});
                 result.branch_taken = evaluate_condition(
@@ -813,6 +813,26 @@ std::string render_digest(
         }
         out << ",\"evidence\":"; quoted(out, digest.memory[index].evidence); out << '}';
     }
+    out << "],\"state_updates\":[";
+    std::string prior_global;
+    for (const Fact& item : digest.memory) {
+        if (item.text.starts_with("read:global=") &&
+            item.text.find("initial=") != std::string::npos) {
+            prior_global = item.text.substr(std::string_view("read:global=").size());
+            break;
+        }
+    }
+    std::size_t update_index = 0;
+    for (const Fact& item : digest.memory) {
+        if (!item.text.starts_with("write:global=")) continue;
+        if (update_index++ != 0) out << ',';
+        out << "{\"storage\":\"global\",\"prior_value\":";
+        quoted(out, prior_global.empty() ? "unknown" : prior_global);
+        out << ",\"new_value\":";
+        quoted(out, item.text.substr(std::string_view("write:global=").size()));
+        out << ",\"persists_across_calls\":true,\"evidence\":";
+        quoted(out, item.evidence); out << '}';
+    }
     out << "],\"constants\":[";
     std::size_t constant_index = 0;
     for (const std::uint64_t constant : digest.constants) {
@@ -1016,6 +1036,9 @@ std::string render_agent_json(
             default_expression.empty() ? "unknown" : default_expression,
             default_node == nullptr ? "" : evidence_id(default_node->start, default_node->end)};
         digest.switches.push_back(std::move(fact));
+    }
+    if (!digest.switches.empty()) {
+        digest.paths.clear();
     }
 
     std::string rendered = render_digest(function, semantic, digest);

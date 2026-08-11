@@ -195,6 +195,10 @@ def _assert_semantic_context(category: str | None, context: dict[str, Any]) -> b
                   if item.get("effect") == "write:global"]
         if not any("arg0" in item and "arg1" in item for item in writes):
             raise AssertionError("global-memory context lacks the written value expression")
+        updates = context.get("state_updates", [])
+        if (not updates or not updates[0].get("persists_across_calls") or
+                "initial=" not in str(updates[0].get("prior_value", ""))):
+            raise AssertionError("global-memory context lacks persistent initial state")
     elif category == "structure-access":
         if (not any("arg0" in item and "arg1" in item for item in returns) or
                 not {"0x9", "0x1234"}.issubset(constants)):
