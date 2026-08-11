@@ -121,6 +121,9 @@ Matched AIRECE and Ghidra usage instructions are in
 `docs/benchmark-tool-instructions.md`. The benchmark uses both a blinded
 common-capability track and a native-agent track so Ghidra's likely pretraining
 advantage is measured separately from the quality of each tool's context.
+The frozen model target is LM Studio model `prism-ml/bonsai-27b`, available at
+`http://172.18.208.1:1234` or host-local `http://localhost:1234`; the harness
+uses `/v1/responses` for function-tool runs.
 
 The AIRECE build disables XAIR's bootstrap decoder and CFG's `fast-x86` and
 `zydis-mini` compatibility decoders. It exposes no decoder-selection CLI flag.

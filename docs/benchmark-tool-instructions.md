@@ -6,6 +6,12 @@ not hidden scoring instructions. Their exact UTF-8 contents and hashes must be
 recorded with every run, and their tokens count toward the condition's input
 budget.
 
+The frozen benchmark model is `prism-ml/bonsai-27b`, served by LM Studio at
+`http://172.18.208.1:1234` with `http://localhost:1234` as the host-local
+fallback. Native-agent tool schemas are passed through LM Studio's
+`/v1/responses` function-tool interface. The prompt text below must be supplied
+as condition instructions; do not assume the model retained it between runs.
+
 Run two complementary comparisons:
 
 1. **Common-capability, blinded track.** Present the same abstract operations

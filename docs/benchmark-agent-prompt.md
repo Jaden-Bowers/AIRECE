@@ -44,14 +44,31 @@ Before doing anything else
    server and not its GUI.
 4. The benchmark model is Bonsai 27B, a roughly 4 GB ternary quantization of a
    Qwen3.6 27B model with reasoning, coding, vision, and tool-use capabilities.
-   Inspect the machine to locate the already installed Bonsai model and its
-   local runner. Do not download a model and do not use a paid/cloud API. Record
-   the exact model path/name, file hash where available, quantization/build
-   metadata, context length, runner version, chat/prompt template, reasoning
-   controls, seed, temperature, and every generation setting. Do not substitute
-   a smaller or different model without explicit user approval. If Bonsai or a
-   compatible runner cannot be found, finish the harness and stop with one
-   precise configuration question.
+   It is already served by LM Studio with model identifier
+   `prism-ml/bonsai-27b`. The preferred base URL is
+   `http://172.18.208.1:1234`; `http://localhost:1234` is a verified fallback
+   when the harness runs directly on the Windows host. Both currently answer
+   `GET /v1/models` and list the required identifier. Do not download a model,
+   do not use a paid/cloud API, and do not substitute another listed model
+   without explicit user approval. Record the model identifier, model file hash
+   where LM Studio exposes it, quantization/build metadata, context length, LM
+   Studio version, loaded-model settings, chat/prompt template, reasoning
+   controls, seed, temperature, and every generation setting.
+
+   Implement a dedicated LM Studio adapter. Prefer the OpenAI-compatible
+   `POST /v1/responses` endpoint for benchmark tasks because it accepts explicit
+   function tool definitions and `tool_choice: "auto"`. Also support LM
+   Studio's native `POST /api/v1/chat` endpoint for a no-tool connectivity smoke
+   test. Make the base URL configurable, probe `/v1/models` before a run, fail
+   if `prism-ml/bonsai-27b` is absent, and store sanitized request/response
+   envelopes plus usage fields. There is no API key. Never silently fall back
+   from a failed tool-capable request to a different model or endpoint.
+
+   Equivalent connectivity examples are:
+
+   `curl http://172.18.208.1:1234/api/v1/chat -H "Content-Type: application/json" -d '{"model":"prism-ml/bonsai-27b","system_prompt":"Reply with OK only.","input":"Connectivity check"}'`
+
+   `curl http://172.18.208.1:1234/v1/responses -H "Content-Type: application/json" -d '{"model":"prism-ml/bonsai-27b","input":"Call the provided echo tool with value OK.","tools":[{"type":"function","name":"echo","description":"Return the provided value","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}],"tool_choice":"auto"}'`
 
 Goal and experimental question
 ------------------------------
@@ -228,8 +245,9 @@ document with CLI overrides. Provide:
 - deterministic dataset generation/build commands;
 - a Ghidra headless export script;
 - AIRECE and Ghidra tool adapters;
-- a local command-runner adapter and/or an OpenAI-compatible local HTTP adapter,
-  depending on what is already installed;
+- an LM Studio adapter for `prism-ml/bonsai-27b` using configurable
+  `/v1/responses` and `/api/v1/chat` URLs, health/model checks, tool-call loops,
+  usage capture, bounded retries, and transcript redaction;
 - resumable execution with atomic per-run JSONL records;
 - schema validation for model answers;
 - hidden-oracle reconstruction compilation/testing;
