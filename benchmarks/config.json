@@ -11,7 +11,7 @@
     "reasoning_control": "explicit-none",
     "reasoning": {"effort": "none"},
     "tool_transport": "json-protocol",
-    "max_protocol_request_bytes": 28000
+    "max_protocol_request_bytes": 22000
   },
   "budgets": {
     "max_tool_calls": 6,
