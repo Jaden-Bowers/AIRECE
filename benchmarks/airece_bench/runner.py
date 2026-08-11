@@ -283,12 +283,14 @@ def _report(summary: dict[str, Any], manifest: dict[str, Any]) -> str:
         if key.endswith("objective"):
             result = (f"fields {group.get('fields_correct', 0)}/{group.get('fields_total', 0)}; "
                       f"evidence {group.get('evidence_valid', 0)}/{group.get('evidence_total', 0)}; "
-                      f"structure {group.get('final_structure_valid', 0)}/{group['runs']}; "
+                      f"raw/final structure {group.get('raw_structure_valid', 0)}/"
+                      f"{group.get('final_structure_valid', 0)} of {group['runs']}; "
                       f"unsupported {group.get('unsupported_claims', 0)}/{group.get('claims', 0)}")
         else:
             result = (f"compile {group.get('compiled', 0)}/{group['runs']}; tests "
                       f"{group.get('tests_passed', 0)}/{group.get('tests_total', 0)}; "
-                      f"structure {group.get('final_structure_valid', 0)}/{group['runs']}")
+                      f"raw/final structure {group.get('raw_structure_valid', 0)}/"
+                      f"{group.get('final_structure_valid', 0)} of {group['runs']}")
         lines.append(f"| {key} | {group['runs']} | {result} | "
                      f"{group['input_tokens']}/{group['output_tokens']} | {group['tool_calls']} |")
     lines += ["", "## Paired differences (AIRECE minus Ghidra)", ""]

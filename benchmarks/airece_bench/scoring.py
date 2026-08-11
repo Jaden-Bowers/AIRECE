@@ -271,6 +271,9 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
                     model.get("protocol_compliance", {}).get("errors", 0) == 0 and
                     model.get("protocol_compliance", {}).get("recoveries", 0) == 0
                     for model in protocol_models),
+                 "raw_structure_valid": sum(
+                    not item.get("model", {}).get("raw_validation_errors", [])
+                    for item in items if item.get("model")),
                  "final_structure_valid": sum(
                     not item.get("model", {}).get("final_validation_errors", [])
                     for item in items if item.get("model")),
@@ -321,6 +324,8 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
                 group.get("protocol_applicable", 1)
                 if group.get("protocol_applicable", 0) else None,
             "final_structure": group.get("final_structure_valid", 0) / group["runs"]
+                if group["runs"] else 0.0,
+            "raw_structure": group.get("raw_structure_valid", 0) / group["runs"]
                 if group["runs"] else 0.0,
             "evidence_validity": group.get("evidence_valid", 0) / group.get("evidence_total", 1)
                 if task == "objective" and group.get("evidence_total", 0) else 0.0,
