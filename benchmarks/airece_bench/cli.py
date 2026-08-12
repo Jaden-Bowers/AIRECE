@@ -16,6 +16,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--split", choices=("development", "heldout"), default="heldout")
     parser.add_argument("--track", action="append", choices=("single", "common", "native"),
                         help="Run only the selected track; may be repeated")
+    parser.add_argument("--condition", action="append", choices=("airece", "ghidra"),
+                        help="Run only the selected analyzer condition; may be repeated")
     parser.add_argument("--category", action="append",
                         help="Select one deterministic case from each named category; may repeat")
     parser.add_argument("--balanced-categories", action="store_true",
@@ -38,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
     runner = BenchmarkRunner(root, (root / arguments.config).resolve(), overrides)
     if arguments.track:
         runner.config["tracks"] = arguments.track
+    if arguments.condition:
+        runner.config["conditions"] = arguments.condition
     if arguments.category:
         runner.config["selection_categories"] = arguments.category
     if arguments.balanced_categories:

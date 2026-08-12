@@ -355,6 +355,12 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
                     for item in items for request in item.get("model", {}).get("requests", [])),
                  "transport_retries": sum(max(0, int(request.get("_transport_attempts", 1)) - 1)
                     for item in items for request in item.get("model", {}).get("requests", [])),
+                 "duplicate_tool_calls": sum(int(item.get("model", {}).get(
+                     "duplicate_tool_calls", 0)) for item in items),
+                 "initial_tool_events": sum(int(item.get("model", {}).get(
+                     "initial_tool_events", 0)) for item in items),
+                 "final_evidence_bytes": sum(int(item.get("model", {}).get(
+                     "final_evidence", {}).get("utf8_bytes", 0)) for item in items),
                  "analysis_ms": round(sum(analysis_ms(item) for item in items), 3),
                  "model_ms": round(sum(item.get("model", {}).get("model_elapsed_ms", 0) for item in items), 3),
                  "end_to_end_ms": round(sum(item.get("end_to_end_ms", 0) for item in items), 3),

@@ -14,30 +14,35 @@ COMMON_TOOLS = [
     {"type": "function", "name": "inspect", "description": "Inspect binary metadata and analysis completeness.",
      "parameters": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"type": "function", "name": "list_functions", "description": "List analyzed functions.",
-     "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 256}},
+     "parameters": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 64}},
                     "additionalProperties": False}},
     {"type": "function", "name": "function_context", "description": "Get primary or low-level context for a function.",
      "parameters": {"type": "object", "properties": {"address": {"type": "string"},
                     "level": {"type": "string", "enum": ["primary", "low_level"]},
-                    "limit": {"type": "integer", "minimum": 16, "maximum": 256}},
+                    "limit": {"type": "integer", "minimum": 16, "maximum": 64}},
                     "required": ["address", "level"], "additionalProperties": False}},
     {"type": "function", "name": "calls", "description": "Get calls made by a function.",
      "parameters": {"type": "object", "properties": {"address": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 256}},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 64}},
                     "required": ["address"], "additionalProperties": False}},
     {"type": "function", "name": "xrefs", "description": "Get references to or from an address.",
      "parameters": {"type": "object", "properties": {"address": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 256}},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 64}},
                     "required": ["address"], "additionalProperties": False}},
 ]
 
 
-AIRECE_NATIVE_TOOLS = [COMMON_TOOLS[0],
-    {**COMMON_TOOLS[1], "name": "functions"},
-    {"type": "function", "name": "fn", "description": "Render an AIRECE function view.",
+AIRECE_NATIVE_TOOLS = [
+    {"type": "function", "name": "fn", "description":
+        "Get the bounded AIRECE agent digest for a function, normally a followed callee.",
      "parameters": {"type": "object", "properties": {"address": {"type": "string"},
-        "view": {"type": "string", "enum": ["agent", "compact", "json", "pseudo", "ir"]},
-        "limit": {"type": "integer", "minimum": 16, "maximum": 256}},
+        "limit": {"type": "integer", "minimum": 16, "maximum": 64}},
+        "required": ["address"], "additionalProperties": False}},
+    {"type": "function", "name": "fn_detail", "description":
+        "Get a bounded lower-level view only when the supplied agent digest lacks a needed fact.",
+     "parameters": {"type": "object", "properties": {"address": {"type": "string"},
+        "view": {"type": "string", "enum": ["compact", "json", "pseudo", "ir"]},
+        "limit": {"type": "integer", "minimum": 16, "maximum": 64}},
         "required": ["address", "view"], "additionalProperties": False}},
     COMMON_TOOLS[3], COMMON_TOOLS[4],
     {"type": "function", "name": "evidence", "description": "Resolve an AIRECE evidence or statement identifier.",
@@ -56,10 +61,10 @@ AIRECE_NATIVE_TOOLS = [COMMON_TOOLS[0],
 ]
 
 
-GHIDRA_NATIVE_TOOLS = [COMMON_TOOLS[0], COMMON_TOOLS[1], COMMON_TOOLS[2],
+GHIDRA_NATIVE_TOOLS = [COMMON_TOOLS[2],
     {"type": "function", "name": "disassembly", "description": "Get bounded function disassembly.",
      "parameters": {"type": "object", "properties": {"address": {"type": "string"},
-        "limit": {"type": "integer", "minimum": 16, "maximum": 256}},
+        "limit": {"type": "integer", "minimum": 16, "maximum": 64}},
                     "required": ["address"], "additionalProperties": False}},
     COMMON_TOOLS[3], COMMON_TOOLS[4]]
 
@@ -112,7 +117,11 @@ class Backend:
         return rendered
 
     def execute(self, name: str, arguments: dict[str, Any], track: str) -> str:
-        key = canonical_json({"name": name, "arguments": arguments, "track": track})
+        cache_arguments = copy.deepcopy(arguments)
+        if name in {"fn", "fn_detail", "function_context", "disassembly",
+                    "calls", "xrefs", "functions", "list_functions"}:
+            cache_arguments.setdefault("limit", 64)
+        key = canonical_json({"name": name, "arguments": cache_arguments, "track": track})
         self._call_number += 1
         if key in self._calls:
             original, _ = self._calls[key]
@@ -130,21 +139,24 @@ class AireceBackend(Backend):
         self.timeout = timeout
 
     def _execute(self, name: str, arguments: dict[str, Any], track: str) -> str:
+        requested_name = name
         if track in {"single", "common"}:
             name = {"list_functions": "functions", "function_context": "fn"}.get(name, name)
         command = [str(self.executable)]
         if name == "inspect": command += ["inspect", str(self.binary), "--profile", "balanced"]
         elif name == "functions": command += ["functions", str(self.binary), "--profile", "balanced"]
-        elif name == "fn":
-            view = arguments.get("view") or ("agent" if arguments.get("level") == "primary" else "ir")
-            limit = min(max(int(arguments.get("limit", 256)), 16), 256)
+        elif name in {"fn", "fn_detail"}:
+            view = (str(arguments["view"]) if requested_name == "fn_detail" else
+                    ("agent" if requested_name == "fn" and "level" not in arguments else
+                     ("agent" if arguments.get("level") == "primary" else "ir")))
+            limit = min(max(int(arguments.get("limit", 64)), 16), 64)
             command += ["fn", str(self.binary), str(arguments["address"]), "--view", view,
                         "--profile", "fast", "--max-bytes", str(self.max_bytes),
                         "--max-statements", str(limit), "--max-evidence", str(limit)]
         elif name in {"calls", "xrefs"}:
             command += [name, str(self.binary), str(arguments["address"])]
             if name == "calls":
-                command += ["--max-calls", str(min(max(int(arguments.get("limit", 256)), 1), 256))]
+                command += ["--max-calls", str(min(max(int(arguments.get("limit", 64)), 1), 64))]
         elif name in {"evidence", "slice"}:
             command += [name, str(self.binary), str(arguments["locator"])]
         elif name == "path":
@@ -184,7 +196,7 @@ class GhidraBackend(Backend):
         started = time.perf_counter()
         if name == "inspect": value: Any = self.document["program"]
         elif name == "list_functions":
-            limit = min(int(arguments.get("limit", 256)), 256)
+            limit = min(max(int(arguments.get("limit", 64)), 1), 64)
             value = [{key: function[key] for key in ("entry", "name", "signature",
                                                       "body_min", "body_max")}
                      for function in self.document["functions"][:limit]]
@@ -200,15 +212,15 @@ class GhidraBackend(Backend):
                 value = {key: function[key] for key in keys}
                 if level == "low_level":
                     value["instructions"] = value["instructions"][:min(
-                        max(int(arguments.get("limit", 256)), 16), 256)]
+                        max(int(arguments.get("limit", 64)), 16), 64)]
             elif name == "disassembly": value = function["instructions"][:min(
-                max(int(arguments.get("limit", 256)), 16), 256)]
+                max(int(arguments.get("limit", 64)), 16), 64)]
             elif name == "calls": value = function["calls"][:min(
-                max(int(arguments.get("limit", 256)), 1), 256)]
+                max(int(arguments.get("limit", 64)), 1), 64)]
             else: value = {"to_function": function["xrefs_to"],
                            "from_function_calls": function["calls"]}
             if name == "xrefs":
-                limit = min(max(int(arguments.get("limit", 256)), 1), 256)
+                limit = min(max(int(arguments.get("limit", 64)), 1), 64)
                 value = {key: items[:limit] for key, items in value.items()}
         else:
             return canonical_json({"ok": False, "error": "unavailable tool"})

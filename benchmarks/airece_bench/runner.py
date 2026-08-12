@@ -95,6 +95,14 @@ def _validate_direct_final(task: str, text: str) -> list[str]:
         return [error or "invalid C function"]
     if text.strip() != function.strip():
         return ["final answer must contain exactly one raw C function and no wrapper"]
+    analyzer_syntax = re.search(
+        r"\b(?:tmp_(?:v)?\d+|tmp\d+|buffer_v\d+|stack_[A-Za-z0-9_]*|"
+        r"global_[0-9a-fA-F]+|arg[01]|r(?:ax|bx|cx|dx|si|di|sp|bp|8|9|10|11|12|13|14|15)|"
+        r"load(?:8|16|32|64)|"
+        r"store(?:8|16|32|64)|extract|[zs]ext|sub_[0-9a-fA-F]+|"
+        r"uint(?:8|16|64)_t)\b", function)
+    if analyzer_syntax:
+        return [f"function contains unresolved analyzer syntax: {analyzer_syntax.group(0)}"]
     return []
 
 
@@ -516,6 +524,18 @@ class BenchmarkRunner:
                 record["ghidra_extraction"] = extraction
                 def execute_tool(name: str, arguments: dict[str, Any]) -> str:
                     return backend.execute(name, arguments, job["track"])
+                initial_tool_events: list[dict[str, Any]] = []
+                if job["track"] == "native":
+                    baseline_name = "fn" if job["condition"] == "airece" else \
+                        "function_context"
+                    baseline_arguments = ({"address": case["target_address"], "limit": 64}
+                        if job["condition"] == "airece" else
+                        {"address": case["target_address"], "level": "primary", "limit": 64})
+                    baseline = execute_tool(baseline_name, baseline_arguments)
+                    initial_tool_events.append({"name": baseline_name,
+                        "arguments": baseline_arguments, "executed": True,
+                        "baseline": True, "result": baseline,
+                        "result_size": {"utf8_bytes": len(baseline.encode("utf-8"))}})
                 if job["track"] == "single":
                     context = execute_tool("function_context", {
                         "address": case["target_address"], "level": "primary"})
@@ -535,12 +555,15 @@ class BenchmarkRunner:
                     model = lm.run_json_protocol(visible, task_prompt, schemas,
                         execute_tool, self.config["budgets"]["max_tool_calls"],
                         self.config["budgets"]["max_input_bytes"],
-                        OBJECTIVE_SCHEMA if job["task"] == "objective" else None)
+                        OBJECTIVE_SCHEMA if job["task"] == "objective" else None,
+                        initial_tool_events,
+                        lambda text: _validate_direct_final(job["task"], text),
+                        lambda text: _normalize_direct_final(job["task"], text))
                 else:
                     model = lm.run_tools(visible, task_prompt, schemas,
                         execute_tool, self.config["budgets"]["max_tool_calls"],
                         self.config["budgets"]["max_input_bytes"])
-                if job["track"] != "single":
+                if job["track"] != "single" and "raw_validation_errors" not in model:
                     raw_final = model["final_text"]
                     normalized_final = _normalize_direct_final(job["task"], raw_final)
                     model["raw_final_text"] = raw_final

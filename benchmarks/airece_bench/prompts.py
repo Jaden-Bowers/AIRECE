@@ -87,6 +87,9 @@ Return only one self-contained C function with this exact signature:
 uint32_t target(uint32_t a, uint32_t b)
 Do not include headers, main, prose, markdown fences, assembly, pragmas, imports, or calls
 to operating-system or library APIs. Unsigned 32-bit wraparound is intentional.
+Express recovered behavior using only a, b, uint32_t local variables, constants, ordinary C
+operators, and structured control flow. Do not copy analyzer temporaries, registers, memory
+primitives, addresses-as-variables, or unresolved helper names into the function.
 """
 
 

@@ -28,9 +28,63 @@ To finish:
 FINAL_VALUE must be the exact requested final answer: an object for a JSON task
 or a string containing source code for a reconstruction task. Request only a
 tool in the catalog below. After a tool result, either request another catalog
-tool or finish. Never emit XML/tool-call tags.
+tool or finish. When `initial_context` is present, treat it as the first tool
+result and do not request it again. Never repeat an exact tool request; a
+duplicate closes tool selection. Never emit XML/tool-call tags.
 Tool catalog:
 """ + canonical_json(catalog) + "\n"
+
+
+def _utf8_prefix(text: str, maximum: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= maximum:
+        return text
+    return encoded[:maximum].decode("utf-8", "ignore")
+
+
+def compact_tool_evidence(tool_events: list[dict[str, Any]],
+                          maximum: int = 8000) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Keep complete, unique, high-value records within a final-turn byte budget."""
+    seen: set[str] = set()
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    omitted = 0
+    has_baseline = any(bool(event.get("baseline")) for event in tool_events)
+    for index, event in enumerate(tool_events):
+        result = event.get("result")
+        if not isinstance(result, str):
+            omitted += 1
+            continue
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict) and "same_result_as_call" in parsed:
+                omitted += 1
+                continue
+        except json.JSONDecodeError:
+            pass
+        digest = sha256_bytes(result.encode("utf-8"))
+        if digest in seen:
+            omitted += 1
+            continue
+        seen.add(digest)
+        name = str(event.get("name", ""))
+        if has_baseline and name in {"inspect", "functions", "list_functions"}:
+            omitted += 1
+            continue
+        priority = (0 if event.get("baseline") else
+                    1 if name in {"evidence", "slice", "calls", "xrefs", "flow", "path"} else
+                    2 if name in {"fn", "function_context"} else 3)
+        record = {"call": index + 1, "tool": name,
+                  "arguments": event.get("arguments", {}), "result": result}
+        candidates.append((priority, index, record))
+    selected: list[dict[str, Any]] = []
+    for _, _, record in sorted(candidates):
+        if len(canonical_json(selected + [record]).encode("utf-8")) <= maximum:
+            selected.append(record)
+        else:
+            omitted += 1
+    selected.sort(key=lambda item: int(item["call"]))
+    return selected, {"included": len(selected), "omitted": omitted,
+                      "utf8_bytes": len(canonical_json(selected).encode("utf-8"))}
 
 
 class LMStudioAdapter:
@@ -366,14 +420,18 @@ reported structural problems.\n"""
                           executor: Callable[[str, dict[str, Any]], str],
                           max_tool_calls: int,
                           max_input_bytes: int = 120000,
-                          final_schema: dict[str, Any] | None = None) -> dict[str, Any]:
+                          final_schema: dict[str, Any] | None = None,
+                          initial_tool_events: list[dict[str, Any]] | None = None,
+                          final_validator: Callable[[str], list[str]] | None = None,
+                          final_normalizer: Callable[[str], str] | None = None) -> dict[str, Any]:
         if self.base_url is None:
             self.probe()
         protocol = json_protocol_instructions(tools)
         full_instructions = instructions + "\n" + protocol
         requests: list[dict[str, Any]] = []
         responses: list[dict[str, Any]] = []
-        tool_events: list[dict[str, Any]] = []
+        tool_events: list[dict[str, Any]] = json.loads(canonical_json(
+            initial_tool_events or []))
         protocol_errors: list[str] = []
         protocol_recoveries: list[str] = []
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
@@ -383,12 +441,30 @@ reported structural problems.\n"""
         total_model_ms = 0.0
         executed_calls = 0
         turns = 0
+        duplicate_tool_calls = 0
+        force_final = False
+        raw_final_text = ""
+        raw_validation_errors: list[str] = []
+        final_validation_errors: list[str] = []
+        normalizations: list[dict[str, Any]] = []
+        final_evidence_summary = {"included": 0, "omitted": 0, "utf8_bytes": 0}
+        final_repair_attempted = False
 
         def finish(final: str, headers: dict[str, Any]) -> dict[str, Any]:
             return {"transport": "json-protocol", "final_text": final,
+                "raw_final_text": raw_final_text or final,
+                "raw_validation_errors": raw_validation_errors,
+                "final_validation_errors": final_validation_errors,
+                "normalizations": normalizations,
+                "repair_attempted": final_repair_attempted or bool(normalizations),
+                "repair_succeeded": (final_repair_attempted or bool(normalizations)) and
+                    not final_validation_errors,
                 "usage": usage, "requests": requests, "responses": responses,
                 "tool_events": tool_events, "protocol_errors": protocol_errors,
                 "protocol_recoveries": protocol_recoveries,
+                "duplicate_tool_calls": duplicate_tool_calls,
+                "initial_tool_events": len(initial_tool_events or []),
+                "final_evidence": final_evidence_summary,
                 "model_elapsed_ms": total_model_ms,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
                 "final_size": text_size(final),
@@ -400,62 +476,106 @@ reported structural problems.\n"""
                     self.config.get("separate_final_generation"))}
 
         def direct_final(draft: str, prior_headers: dict[str, Any]) -> dict[str, Any]:
-            nonlocal total_model_ms
+            nonlocal total_model_ms, raw_final_text, raw_validation_errors
+            nonlocal final_validation_errors, final_evidence_summary
+            nonlocal final_repair_attempted
             if not self.config.get("separate_final_generation"):
-                return finish(draft, prior_headers)
-            evidence = [{"tool": event.get("name"), "result": event.get("result")}
-                        for event in tool_events]
-            final_input = canonical_json({"task": user_input, "evidence": evidence,
-                                          "draft": draft})
-            final_instructions = instructions + """
+                raw_final_text = draft
+                final = final_normalizer(draft) if final_normalizer else draft
+                raw_validation_errors = final_validator(draft) if final_validator else []
+                final_validation_errors = final_validator(final) if final_validator else []
+                return finish(final, prior_headers)
+            evidence, final_evidence_summary = compact_tool_evidence(
+                tool_events, int(self.config.get("max_final_evidence_bytes", 8000)))
+            draft_limit = int(self.config.get("max_final_draft_bytes", 4000))
+            bounded_draft = _utf8_prefix(draft, draft_limit)
+            final = bounded_draft
+            headers = prior_headers
+            for attempt in range(2 if final_validator else 1):
+                final_instructions = instructions + """
 
 Tool selection is complete and tools are unavailable. Produce only the exact final answer
 requested by the task. Do not emit a tool-protocol wrapper, commentary, or markdown fence.
 """
-            if final_schema is not None:
-                final_instructions += "\nThe required final JSON schema is:\n" + \
-                    canonical_json(final_schema) + "\n"
-            payload: dict[str, Any] = {"model": self.config["id"],
-                "instructions": final_instructions, "input": final_input,
-                "temperature": self.config["temperature"], "seed": self.config["seed"],
-                "max_output_tokens": self.config["max_output_tokens"], "store": False}
-            if final_schema is not None and self.config.get("schema_constrained_final"):
-                payload["text"] = {"format": {"type": "json_schema",
-                    "name": "objective_answers", "schema": final_schema, "strict": True}}
-            if self.config.get("reasoning") is not None:
-                payload["reasoning"] = self.config["reasoning"]
-            payload_bytes = len(canonical_json(payload).encode("utf-8"))
-            if payload_bytes > max_input_bytes:
-                raise LMStudioError(
-                    f"direct-final envelope exceeds input byte budget: {payload_bytes}>{max_input_bytes}")
-            remaining = self.timeout - (time.perf_counter() - started)
-            if remaining <= 0:
-                raise LMStudioError("task wall-clock budget exhausted before final generation")
-            requests.append(self._sanitize(payload))
-            response, headers, elapsed = self._request(
-                "POST", self.config["responses_path"], payload, timeout=max(1, remaining))
-            requests[-1]["_transport_attempts"] = self.last_request_attempts
-            requests[-1]["_utf8_bytes"] = payload_bytes
-            total_model_ms += elapsed
-            responses.append(self._sanitize(response))
-            current = response.get("usage") or {}
-            usage["input_tokens"] += int(current.get("input_tokens") or 0)
-            usage["output_tokens"] += int(current.get("output_tokens") or 0)
-            usage["total_tokens"] += int(current.get("total_tokens") or 0)
-            usage["reasoning_tokens"] += int(
-                (current.get("output_tokens_details") or {}).get("reasoning_tokens") or 0)
-            usage["cached_tokens"] += int(
-                (current.get("input_tokens_details") or {}).get("cached_tokens") or 0)
-            if response.get("status") not in {"completed", "incomplete"}:
-                raise LMStudioError(f"direct-final response failed: {response.get('error')}")
-            return finish(self._text(response), headers)
+                if final_schema is None:
+                    final_instructions += """
+Reconstruct behavior, not analyzer syntax. Use only the parameters a and b, uint32_t local
+variables, integer constants, ordinary C operators, and structured control flow. Never copy
+analysis identifiers or primitives such as tmp_v*, buffer_v*, stack_*, load32, store32,
+extract, zext, registers, addresses as variables, or unresolved helper calls. Inline any
+needed helper behavior. Return exactly uint32_t target(uint32_t a, uint32_t b) { ... }.
+"""
+                else:
+                    final_instructions += "\nThe required final JSON schema is:\n" + \
+                        canonical_json(final_schema) + "\n"
+                if attempt == 0:
+                    final_value: dict[str, Any] = {"task": user_input,
+                        "evidence": evidence, "evidence_summary": final_evidence_summary,
+                        "draft": bounded_draft}
+                else:
+                    final_repair_attempted = True
+                    final_instructions += """
+This is a deterministic structural repair. Preserve supported behavior, correct only the
+reported validation problems, and return the required artifact with no wrapper.
+"""
+                    final_value = {"task": user_input, "evidence": evidence,
+                        "invalid_previous_answer": final,
+                        "validation_errors": final_validation_errors}
+                payload: dict[str, Any] = {"model": self.config["id"],
+                    "instructions": final_instructions,
+                    "input": canonical_json(final_value),
+                    "temperature": self.config["temperature"], "seed": self.config["seed"],
+                    "max_output_tokens": self.config["max_output_tokens"], "store": False}
+                if final_schema is not None and self.config.get("schema_constrained_final"):
+                    payload["text"] = {"format": {"type": "json_schema",
+                        "name": "objective_answers", "schema": final_schema, "strict": True}}
+                if self.config.get("reasoning") is not None:
+                    payload["reasoning"] = self.config["reasoning"]
+                payload_bytes = len(canonical_json(payload).encode("utf-8"))
+                if payload_bytes > max_input_bytes:
+                    raise LMStudioError(
+                        f"direct-final envelope exceeds input byte budget: {payload_bytes}>{max_input_bytes}")
+                remaining = self.timeout - (time.perf_counter() - started)
+                if remaining <= 0:
+                    raise LMStudioError("task wall-clock budget exhausted before final generation")
+                requests.append(self._sanitize(payload))
+                response, headers, elapsed = self._request(
+                    "POST", self.config["responses_path"], payload, timeout=max(1, remaining))
+                requests[-1]["_transport_attempts"] = self.last_request_attempts
+                requests[-1]["_utf8_bytes"] = payload_bytes
+                total_model_ms += elapsed
+                responses.append(self._sanitize(response))
+                current = response.get("usage") or {}
+                usage["input_tokens"] += int(current.get("input_tokens") or 0)
+                usage["output_tokens"] += int(current.get("output_tokens") or 0)
+                usage["total_tokens"] += int(current.get("total_tokens") or 0)
+                usage["reasoning_tokens"] += int(
+                    (current.get("output_tokens_details") or {}).get("reasoning_tokens") or 0)
+                usage["cached_tokens"] += int(
+                    (current.get("input_tokens_details") or {}).get("cached_tokens") or 0)
+                if response.get("status") not in {"completed", "incomplete"}:
+                    raise LMStudioError(f"direct-final response failed: {response.get('error')}")
+                response_text = self._text(response)
+                if attempt == 0:
+                    raw_final_text = response_text
+                    raw_validation_errors = (final_validator(response_text)
+                                             if final_validator else [])
+                final = final_normalizer(response_text) if final_normalizer else response_text
+                if final != response_text:
+                    normalizations.append({"attempt": attempt + 1,
+                        "input_size": text_size(response_text),
+                        "output_size": text_size(final)})
+                final_validation_errors = final_validator(final) if final_validator else []
+                if not final_validation_errors:
+                    break
+            return finish(final, headers)
 
         while True:
             turns += 1
             if turns > max_tool_calls + 3:
                 raise LMStudioError("JSON protocol turn budget exhausted")
             active_instructions = full_instructions
-            if executed_calls >= max_tool_calls:
+            if executed_calls >= max_tool_calls or force_final:
                 active_instructions = instructions + """
 
 Tool access is exhausted and no tool catalog is available. Return exactly one
@@ -470,7 +590,12 @@ request another tool.
             compactions: list[dict[str, Any]] = []
             while True:
                 envelope = {"task": user_input, "transcript": prompt_transcript,
-                            "remaining_tool_calls": max_tool_calls - executed_calls}
+                            "remaining_tool_calls": (0 if force_final else
+                                max_tool_calls - executed_calls)}
+                if initial_tool_events:
+                    envelope["initial_context"] = [{"tool": event.get("name"),
+                        "arguments": event.get("arguments", {}),
+                        "result": event.get("result")} for event in initial_tool_events]
                 payload: dict[str, Any] = {"model": self.config["id"],
                     "instructions": active_instructions, "input": canonical_json(envelope),
                     "temperature": self.config["temperature"], "seed": self.config["seed"],
@@ -529,7 +654,8 @@ request another tool.
                 protocol_recoveries.append(
                     "accepted non-protocol model output as final")
                 return direct_final(raw.strip(), headers)
-            if executed_calls >= max_tool_calls and (value is None or value.get("action") != "final"):
+            if (executed_calls >= max_tool_calls or force_final) and \
+                    (value is None or value.get("action") != "final"):
                 protocol_recoveries.append(
                     "accepted raw final after tool budget exhaustion")
                 return direct_final(raw.strip(), headers)
@@ -560,12 +686,28 @@ request another tool.
                     result = executor(name, arguments)
                     executed_calls += 1
                     was_executed = True
+                duplicate = False
+                try:
+                    parsed_result = json.loads(result)
+                    duplicate = isinstance(parsed_result, dict) and \
+                        "same_result_as_call" in parsed_result
+                except json.JSONDecodeError:
+                    pass
+                if duplicate:
+                    duplicate_tool_calls += 1
+                    force_final = True
                 tool_events.append({"name": name, "arguments": self._sanitize(normalized_arguments),
                     "executed": was_executed,
+                    "duplicate": duplicate,
                     "result": self._sanitize(result), "result_size": text_size(result)})
                 next_input = {"tool_result": result,
-                    "remaining_tool_calls": max(0, max_tool_calls - executed_calls),
+                    "remaining_tool_calls": (0 if force_final else
+                        max(0, max_tool_calls - executed_calls)),
                     "instruction": "Return the next strict JSON protocol object."}
-                if executed_calls >= max_tool_calls:
+                if duplicate:
+                    next_input["instruction"] = (
+                        "This exact request duplicated an earlier result and produced no new "
+                        "evidence. Tool selection is closed; return action final now.")
+                elif executed_calls >= max_tool_calls:
                     next_input["instruction"] = "Tool budget is exhausted. Return action final now."
                 transcript.append({"assistant": value, "controller": next_input})

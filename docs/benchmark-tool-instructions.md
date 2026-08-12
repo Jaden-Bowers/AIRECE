@@ -57,16 +57,15 @@ v0.10.0-benchmark-rc1. AIRECE is a bounded, AI-oriented static context engine
 for PE/x86-64 binaries. XAIR is its sole semantic IR. AIRECE deliberately emits
 unknown, opaque, partial, or unresolved information instead of guessing.
 
-Start with `inspect` when program-wide completeness matters, and use `functions`
-only when the target is unknown. For a supplied target, prefer `fn --view agent`
-for a bounded digest of parameters, returns, conditions, switches, calls, and
-memory effects. Request `fn --view json` when you need machine-readable
-statements, stable IDs, control transfers, coverage, and evidence; use `fn
---view compact` or `pseudo` as presentation aids. Pseudocode is conservative
-and may retain qualified labels and gotos when a high-level region cannot be
-certified. `fn --view ir` exposes the underlying XAIR when a higher-level view
-has omitted a needed detail. Use the smallest sufficient record limit and
-increase it only when the response reports omitted facts.
+The controller supplies the target function's bounded agent digest before the
+first tool-selection turn. Read it before requesting anything else. It contains
+parameters, returns, conditions, switches, calls, and memory effects. Use `fn`
+to obtain the same agent digest only for a newly followed callee. Use
+`fn_detail` only when the supplied digest lacks one fact required by the task;
+select the narrowest compact, JSON, pseudo, or IR view and a limit no larger
+than 64. Do not request `inspect` or enumerate functions when a target address
+is already supplied. Analyzer temporaries and memory primitives are evidence,
+not source code, and must never be copied into a reconstruction.
 
 Use `calls` for call sites, modeled APIs, effects, and taint roles. Use `xrefs`
 for code/data references. Use `evidence` with a full function-qualified
@@ -92,11 +91,11 @@ Important output rules:
 - Keep byte, statement, evidence, state, query, and time bounds explicit. A
   truncated response is not negative evidence.
 
-Recommended workflow: inspect; list functions; select the smallest relevant
-function set; request JSON or compact context; follow calls/xrefs; retrieve
-evidence or a slice for material claims; use flow/symbolic analysis only for a
-specific dependency or feasibility question; then answer with uncertainty
-preserved.
+Recommended workflow: read the supplied agent digest; answer immediately when
+it is sufficient; otherwise make one narrow calls, xrefs, evidence, slice, or
+`fn_detail` request; follow a callee with `fn` only when its behavior is needed;
+then answer. Exact duplicate requests end tool selection. Use flow, path, or IR
+only for a specific unresolved dependency or feasibility question.
 ```
 
 ## Ghidra 12.1.2 headless native-agent instruction pack

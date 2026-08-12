@@ -12,13 +12,15 @@
     "reasoning_control": "explicit-none",
     "reasoning": {"effort": "none"},
     "tool_transport": "json-protocol",
-    "max_protocol_request_bytes": 60000,
+    "max_protocol_request_bytes": 24000,
+    "max_final_evidence_bytes": 8000,
+    "max_final_draft_bytes": 4000,
     "separate_final_generation": true,
     "schema_constrained_final": false
   },
   "budgets": {
-    "max_tool_calls": 6,
-    "max_tool_result_bytes": 8000,
+    "max_tool_calls": 3,
+    "max_tool_result_bytes": 4000,
     "max_input_bytes": 120000,
     "task_timeout_seconds": 180,
     "analyzer_timeout_seconds": 30,

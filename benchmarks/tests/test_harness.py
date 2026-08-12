@@ -11,7 +11,8 @@ from benchmarks.airece_bench.corpus import (FUNCTIONS, TEST_INPUTS, dense, direc
                                             rotate, sparse, structure)
 from benchmarks.airece_bench.prompts import (extract_sections, instructions,
                                              validate_isolation)
-from benchmarks.airece_bench.lmstudio import LMStudioAdapter
+from benchmarks.airece_bench.lmstudio import (LMStudioAdapter,
+                                               compact_tool_evidence)
 from benchmarks.airece_bench.runner import (_assert_semantic_context, _records,
                                              _normalize_direct_final, _select_cases,
                                              _validate_direct_final,
@@ -35,6 +36,18 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(left, right)
         self.assertEqual(sha256_bytes(left.encode()), sha256_bytes(right.encode()))
         self.assertEqual(left, canonical_json(tool_schema("single", "airece")))
+
+    def test_native_schema_uses_progressive_disclosure(self) -> None:
+        airece = {item["name"]: item for item in tool_schema("native", "airece")}
+        self.assertNotIn("inspect", airece)
+        self.assertNotIn("functions", airece)
+        self.assertEqual(airece["fn"]["parameters"]["required"], ["address"])
+        self.assertNotIn("view", airece["fn"]["parameters"]["properties"])
+        detail_views = airece["fn_detail"]["parameters"]["properties"]["view"]["enum"]
+        self.assertNotIn("agent", detail_views)
+        ghidra = {item["name"]: item for item in tool_schema("native", "ghidra")}
+        self.assertNotIn("inspect", ghidra)
+        self.assertNotIn("list_functions", ghidra)
 
     def test_instruction_pack_isolation_and_hashing(self) -> None:
         common = instructions(self.sections, "common", "airece")
@@ -130,6 +143,8 @@ class ParserScoringTests(unittest.TestCase):
         self.assertEqual(_validate_direct_final("reconstruction", function), [])
         self.assertTrue(_validate_direct_final("reconstruction", "```c\n" + function + "\n```"))
         self.assertTrue(_validate_direct_final("objective", "```json\n{}\n```"))
+        self.assertTrue(_validate_direct_final("reconstruction",
+            "uint32_t target(uint32_t a, uint32_t b) { return load32(buffer_v1); }"))
         self.assertEqual(_normalize_direct_final(
             "reconstruction", "```c\n" + function + "\n```"), function)
         wrapped = json.dumps({"analysis": {"code": function}})
@@ -261,6 +276,21 @@ class ResumeTests(unittest.TestCase):
 
 
 class ToolBudgetTests(unittest.TestCase):
+    def test_compact_final_evidence_deduplicates_and_prefers_baseline(self) -> None:
+        baseline = '{"result":"agent"}'
+        events = [
+            {"name": "fn", "baseline": True, "arguments": {"address": "0x1"},
+             "result": baseline},
+            {"name": "inspect", "arguments": {}, "result": '{"program":true}'},
+            {"name": "fn", "arguments": {"address": "0x1"}, "result": baseline},
+            {"name": "fn", "arguments": {"address": "0x1"},
+             "result": '{"ok":true,"same_result_as_call":1}'},
+        ]
+        evidence, summary = compact_tool_evidence(events, 1000)
+        self.assertEqual([item["tool"] for item in evidence], ["fn"])
+        self.assertEqual(summary["included"], 1)
+        self.assertEqual(summary["omitted"], 3)
+
     def test_direct_final_records_and_repairs_invalid_structure(self) -> None:
         adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
             "responses_path": "/v1/responses", "native_chat_path": "/api/v1/chat",
@@ -332,6 +362,56 @@ class ToolBudgetTests(unittest.TestCase):
         self.assertFalse(result["requests"][1]["store"])
         second_envelope = json.loads(result["requests"][1]["input"])
         self.assertEqual(second_envelope["transcript"][0]["assistant"]["name"], "echo")
+
+    def test_json_protocol_initial_context_and_duplicate_force_final(self) -> None:
+        adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
+            "responses_path": "/v1/responses", "native_chat_path": "/api/v1/chat",
+            "temperature": 0, "seed": 1, "max_output_tokens": 32}, 10)
+        adapter.base_url = "http://unused"
+        responses = iter([
+            {"status": "completed", "usage": {}, "output": [{"type": "message",
+                "content": [{"type": "output_text", "text":
+                    '{"action":"tool","name":"fn","arguments":{"address":"0x1"}}'}]}]},
+            {"status": "completed", "usage": {}, "output": [{"type": "message",
+                "content": [{"type": "output_text", "text":
+                    '{"action":"final","content":"done"}'}]}]},
+        ])
+        adapter._request = lambda *args, **kwargs: (next(responses), {}, 1.0)  # type: ignore[method-assign]
+        initial = [{"name": "fn", "arguments": {"address": "0x1"},
+                    "baseline": True, "result": '{"result":"agent"}'}]
+        result = adapter.run_json_protocol("instructions", "input",
+            [{"name": "fn", "parameters": {}}],
+            lambda name, args: '{"ok":true,"same_result_as_call":1}',
+            3, 10000, initial_tool_events=initial)
+        first_envelope = json.loads(result["requests"][0]["input"])
+        self.assertEqual(first_envelope["initial_context"][0]["tool"], "fn")
+        self.assertEqual(result["duplicate_tool_calls"], 1)
+        self.assertIn("Tool access is exhausted", result["requests"][1]["instructions"])
+
+    def test_json_protocol_repairs_invalid_separated_final(self) -> None:
+        adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
+            "responses_path": "/v1/responses", "native_chat_path": "/api/v1/chat",
+            "temperature": 0, "seed": 1, "max_output_tokens": 32,
+            "separate_final_generation": True}, 10)
+        adapter.base_url = "http://unused"
+        responses = iter([
+            {"status": "completed", "usage": {}, "output": [{"type": "message",
+                "content": [{"type": "output_text", "text":
+                    '{"action":"final","content":{"draft":true}}'}]}]},
+            {"status": "completed", "usage": {}, "output": [{"type": "message",
+                "content": [{"type": "output_text", "text": '{"wrong":true}'}]}]},
+            {"status": "completed", "usage": {}, "output": [{"type": "message",
+                "content": [{"type": "output_text", "text": '{"ok":true}'}]}]},
+        ])
+        adapter._request = lambda *args, **kwargs: (next(responses), {}, 1.0)  # type: ignore[method-assign]
+        validator = lambda text: [] if json.loads(text) == {"ok": True} else ["wrong"]
+        result = adapter.run_json_protocol("instructions", "input", [],
+            lambda name, args: "{}", 1, 10000,
+            final_validator=validator)
+        self.assertEqual(result["raw_final_text"], '{"wrong":true}')
+        self.assertEqual(result["final_text"], '{"ok":true}')
+        self.assertTrue(result["repair_attempted"])
+        self.assertTrue(result["repair_succeeded"])
 
     def test_json_protocol_removes_tools_after_budget(self) -> None:
         adapter = LMStudioAdapter({"id": "model", "base_urls": ["http://unused"],
