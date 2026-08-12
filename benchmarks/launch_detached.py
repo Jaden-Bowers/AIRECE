@@ -19,18 +19,23 @@ def main() -> int:
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--split", choices=("development", "heldout"), default="heldout")
     parser.add_argument("--no-rebuild-corpus", action="store_true")
+    parser.add_argument("--balanced-categories", action="store_true")
+    parser.add_argument("--output-root")
     arguments = parser.parse_args()
 
     root = ROOT
     config = json.loads((root / "benchmarks" / "config.json").read_text(encoding="utf-8"))
-    output = (root / config["paths"]["output_root"]).resolve()
+    output = (root / (arguments.output_root or config["paths"]["output_root"])).resolve()
     output.mkdir(parents=True, exist_ok=True)
     stdout_path = output / "detached-run.stdout.log"
     stderr_path = output / "detached-run.stderr.log"
     status_path = output / "detached-run.json"
     command = [sys.executable, "-u", "-m", "benchmarks.airece_bench.cli",
                "--split", arguments.split, "--max-cases", str(arguments.max_cases),
-               "--repetitions", str(arguments.repetitions)]
+               "--repetitions", str(arguments.repetitions),
+               "--output-root", str(output)]
+    if arguments.balanced_categories:
+        command.append("--balanced-categories")
     if arguments.no_rebuild_corpus:
         command.append("--no-rebuild-corpus")
 
