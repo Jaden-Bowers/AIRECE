@@ -14,10 +14,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-cases", type=int, default=2)
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--split", choices=("development", "heldout"), default="heldout")
-    parser.add_argument("--track", action="append", choices=("common", "native"),
+    parser.add_argument("--track", action="append", choices=("single", "common", "native"),
                         help="Run only the selected track; may be repeated")
     parser.add_argument("--category", action="append",
                         help="Select one deterministic case from each named category; may repeat")
+    parser.add_argument("--balanced-categories", action="store_true",
+                        help="Select one seeded compiler variant from every category")
     parser.add_argument("--task", action="append", choices=("objective", "reconstruction"),
                         help="Run only the selected task; may be repeated")
     parser.add_argument("--output-root",
@@ -38,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
         runner.config["tracks"] = arguments.track
     if arguments.category:
         runner.config["selection_categories"] = arguments.category
+    if arguments.balanced_categories:
+        runner.config["selection_balance_categories"] = True
     if arguments.task:
         runner.config["selection_tasks"] = arguments.task
     if arguments.output_root:

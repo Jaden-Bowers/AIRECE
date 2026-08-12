@@ -12,7 +12,7 @@
     "reasoning_control": "explicit-none",
     "reasoning": {"effort": "none"},
     "tool_transport": "json-protocol",
-    "max_protocol_request_bytes": 22000,
+    "max_protocol_request_bytes": 60000,
     "separate_final_generation": true,
     "schema_constrained_final": false
   },
@@ -39,6 +39,6 @@
     "crt_variants": ["none", "static", "dynamic"],
     "seed": 731942
   },
-  "tracks": ["common", "native"],
+  "tracks": ["single", "common", "native"],
   "conditions": ["airece", "ghidra"]
 }

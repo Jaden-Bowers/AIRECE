@@ -18,6 +18,9 @@ OBJECTIVE_FIELDS = ("parameter_count", "category", "control_shape", "constants",
                     "external_memory_writes", "direct_call_count",
                     "indirect_call_count", "imported_call_count")
 SET_FIELDS = {"constants", "case_values", "return_dependencies"}
+ARTIFACT_CORE_FIELDS = {"parameter_count", "case_values", "return_dependencies",
+                        "external_memory_reads", "external_memory_writes",
+                        "direct_call_count", "indirect_call_count", "imported_call_count"}
 
 
 def extract_json(text: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -44,20 +47,56 @@ def validate_objective(value: dict[str, Any]) -> list[str]:
             len(value["answers"]) != 2:
         return ["root must contain exactly two answers"]
     required = set(OBJECTIVE_SCHEMA["properties"]["answers"]["items"]["required"])
+    categories = set(OBJECTIVE_SCHEMA["properties"]["answers"]["items"]["properties"]
+                     ["category"]["enum"])
+    shapes = set(OBJECTIVE_SCHEMA["properties"]["answers"]["items"]["properties"]
+                 ["control_shape"]["enum"])
     seen: set[str] = set()
     for index, answer in enumerate(value["answers"]):
         if not isinstance(answer, dict) or set(answer) != required:
             errors.append(f"answer {index} fields do not match schema")
             continue
         question = answer.get("question_id")
-        if question not in {"q1", "q2"} or question in seen:
+        if not isinstance(question, str) or question not in {"q1", "q2"} or question in seen:
             errors.append(f"answer {index} has invalid/duplicate question_id")
-        seen.add(question)
+        if isinstance(question, str):
+            seen.add(question)
         if answer.get("status") not in {"answered", "unknown"}:
             errors.append(f"answer {index} has invalid status")
-        for field in ("constants", "case_values", "return_dependencies", "evidence"):
-            if not isinstance(answer.get(field), list):
-                errors.append(f"answer {index}.{field} is not an array")
+        for field in ("parameter_count", "direct_call_count", "indirect_call_count",
+                      "imported_call_count"):
+            field_value = answer.get(field)
+            if field_value is not None and (not isinstance(field_value, int) or
+                                            isinstance(field_value, bool)):
+                errors.append(f"answer {index}.{field} is not integer/null")
+        category = answer.get("category")
+        if category is not None and (not isinstance(category, str) or category not in categories):
+            errors.append(f"answer {index}.category is outside enum")
+        shape = answer.get("control_shape")
+        if shape is not None and (not isinstance(shape, str) or shape not in shapes):
+            errors.append(f"answer {index}.control_shape is outside enum")
+        for field in ("constants", "case_values"):
+            field_value = answer.get(field)
+            if (not isinstance(field_value, list) or any(
+                    not isinstance(item, int) or isinstance(item, bool)
+                    for item in field_value)):
+                errors.append(f"answer {index}.{field} is not an integer array")
+        dependencies = answer.get("return_dependencies")
+        if (not isinstance(dependencies, list) or
+                any(not isinstance(item, str) or item not in {"arg0", "arg1"}
+                    for item in dependencies)):
+            errors.append(f"answer {index}.return_dependencies is outside enum")
+        evidence = answer.get("evidence")
+        if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence):
+            errors.append(f"answer {index}.evidence is not a string array")
+        for field in ("stack_memory_reads", "stack_memory_writes",
+                      "external_memory_reads", "external_memory_writes"):
+            field_value = answer.get(field)
+            if field_value is not None and not isinstance(field_value, bool):
+                errors.append(f"answer {index}.{field} is not boolean/null")
+        if answer.get("unknown_reason") is not None and not isinstance(
+                answer.get("unknown_reason"), str):
+            errors.append(f"answer {index}.unknown_reason is not string/null")
     return errors
 
 
@@ -81,12 +120,18 @@ def score_objective(text: str, truth: dict[str, Any], tool_events: list[dict[str
     if value is None:
         return {"schema_valid": False, "schema_errors": [parse_error],
                 "fields_correct": 0, "fields_total": len(OBJECTIVE_FIELDS),
-                "accuracy": 0.0, "unsupported_claims": 0,
+                "exact_accuracy": 0.0, "accuracy": 0.0,
+                "semantic_accuracy": 0.0, "semantic_points": 0.0,
+                "artifact_core_fields": len(ARTIFACT_CORE_FIELDS),
+                "artifact_core_exact": 0, "artifact_core_exact_accuracy": 0.0,
+                "artifact_core_semantic_points": 0.0,
+                "artifact_core_semantic_accuracy": 0.0,
+                "unsupported_claims": 0,
                 "claims": 0, "unknown_fields": len(OBJECTIVE_FIELDS),
                 "evidence_valid": 0, "evidence_total": 0}
     errors = validate_objective(value)
     answers = {item.get("question_id"): item for item in value.get("answers", [])
-               if isinstance(item, dict)}
+               if isinstance(item, dict) and isinstance(item.get("question_id"), str)}
     q1_fields = {"parameter_count", "category", "control_shape", "constants", "case_values"}
     merged = {field: answers.get("q1" if field in q1_fields else "q2", {}).get(field)
               for field in OBJECTIVE_FIELDS}
@@ -95,18 +140,28 @@ def score_objective(text: str, truth: dict[str, Any], tool_events: list[dict[str
     claims = 0
     unknown = 0
     semantic_points = 0.0
+    artifact_exact = 0
+    artifact_semantic_points = 0.0
     field_details: dict[str, Any] = {}
     for field in OBJECTIVE_FIELDS:
         actual = merged.get(field)
         expected = truth[field]
         answer = answers.get("q1" if field in q1_fields else "q2", {})
-        is_unknown = answer.get("status") == "unknown" or actual is None or actual == []
+        # An answered empty set is a meaningful negative result. Only an explicit
+        # unknown status or a null/missing value is unknown.
+        is_unknown = answer.get("status") == "unknown" or actual is None
         if is_unknown:
             unknown += 1
         if field in SET_FIELDS:
             normalize = (lambda item: item & 0xffffffff) if field in {"constants", "case_values"} \
                 else (lambda item: item)
-            actual_set = {normalize(item) for item in (actual or [])}
+            raw_items = actual if isinstance(actual, list) else []
+            if field in {"constants", "case_values"}:
+                raw_items = [item for item in raw_items
+                             if isinstance(item, int) and not isinstance(item, bool)]
+            else:
+                raw_items = [item for item in raw_items if isinstance(item, str)]
+            actual_set = {normalize(item) for item in raw_items}
             expected_set = {normalize(item) for item in expected}
             intersection = len(actual_set & expected_set)
             precision = intersection / len(actual_set) if actual_set else (1.0 if not expected_set else 0.0)
@@ -119,24 +174,39 @@ def score_objective(text: str, truth: dict[str, Any], tool_events: list[dict[str
                                     "recall": recall, "f1": f1,
                                     "actual": sorted(actual_set, key=str),
                                     "expected": sorted(expected_set, key=str)}
-            semantic_points += 0.0 if is_unknown else f1
+            field_semantic = 0.0 if is_unknown else f1
+            semantic_points += field_semantic
         else:
             exact = actual == expected and not is_unknown
             if actual is not None:
                 claims += 1
                 unsupported += 0 if exact else 1
             field_details[field] = {"exact": exact, "actual": actual, "expected": expected}
-            semantic_points += float(exact)
+            field_semantic = float(exact)
+            semantic_points += field_semantic
+        if field in ARTIFACT_CORE_FIELDS:
+            artifact_exact += int(exact)
+            artifact_semantic_points += field_semantic
         correct += int(exact)
     transcript = "\n".join(str(event.get("result", "")) for event in tool_events)
-    evidence = [item for answer in answers.values() for item in answer.get("evidence", [])
+    evidence = [item for answer in answers.values()
+                for item in (answer.get("evidence", [])
+                             if isinstance(answer.get("evidence"), list) else [])
                 if isinstance(item, str)]
     evidence_valid = sum(_evidence_valid(item, transcript, address_start, address_end)
                          for item in evidence)
     return {"schema_valid": not errors, "schema_errors": errors,
             "fields_correct": correct, "fields_total": len(OBJECTIVE_FIELDS),
+            "exact_accuracy": correct / len(OBJECTIVE_FIELDS),
             "accuracy": semantic_points / len(OBJECTIVE_FIELDS),
             "semantic_accuracy": semantic_points / len(OBJECTIVE_FIELDS),
+            "semantic_points": semantic_points,
+            "artifact_core_fields": len(ARTIFACT_CORE_FIELDS),
+            "artifact_core_exact": artifact_exact,
+            "artifact_core_exact_accuracy": artifact_exact / len(ARTIFACT_CORE_FIELDS),
+            "artifact_core_semantic_points": artifact_semantic_points,
+            "artifact_core_semantic_accuracy": artifact_semantic_points /
+                len(ARTIFACT_CORE_FIELDS),
             "field_details": field_details,
             "unsupported_claims": unsupported, "claims": claims,
             "unsupported_claim_rate": unsupported / claims if claims else 0.0,
@@ -302,6 +372,15 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
                     "f1_mean": sum(float(item.get("f1", item.get("exact", False)))
                                    for item in details) / len(details) if details else 0.0}
             group.update({"fields_correct": sum(item.get("fields_correct", 0) for item in scores),
+                          "semantic_points": sum(item.get("semantic_points", 0.0)
+                                                 for item in scores),
+                          "artifact_core_fields": sum(item.get("artifact_core_fields", 0)
+                                                      for item in scores),
+                          "artifact_core_exact": sum(item.get("artifact_core_exact", 0)
+                                                     for item in scores),
+                          "artifact_core_semantic_points": sum(
+                              item.get("artifact_core_semantic_points", 0.0)
+                              for item in scores),
                           "schema_valid": sum(bool(item.get("schema_valid")) for item in scores),
                           "fields_total": sum(item.get("fields_total", 0) for item in scores),
                           "evidence_valid": sum(item.get("evidence_valid", 0) for item in scores),
@@ -316,8 +395,18 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
                           "tests_total": sum(item.get("tests_total", 0) for item in scores)})
         output["groups"]["/".join(key)] = group
         group["rates"] = {
-            "objective_accuracy": group.get("fields_correct", 0) / group.get("fields_total", 1)
+            "objective_exact_accuracy": group.get("fields_correct", 0) / group.get("fields_total", 1)
                 if task == "objective" and group.get("fields_total", 0) else 0.0,
+            "objective_semantic_accuracy": group.get("semantic_points", 0.0) /
+                group.get("fields_total", 1)
+                if task == "objective" and group.get("fields_total", 0) else 0.0,
+            "artifact_core_exact_accuracy": group.get("artifact_core_exact", 0) /
+                group.get("artifact_core_fields", 1)
+                if task == "objective" and group.get("artifact_core_fields", 0) else 0.0,
+            "artifact_core_semantic_accuracy": group.get(
+                "artifact_core_semantic_points", 0.0) /
+                group.get("artifact_core_fields", 1)
+                if task == "objective" and group.get("artifact_core_fields", 0) else 0.0,
             "schema_validity": group.get("schema_valid", 0) / group["runs"]
                 if task == "objective" and group["runs"] else None,
             "protocol_compliance": group.get("protocol_clean", 0) /
@@ -337,6 +426,7 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
             "behavioral": group.get("tests_passed", 0) / group.get("tests_total", 1)
                 if task == "reconstruction" and group.get("tests_total", 0) else None}
 
+    output["clustered_paired"] = {}
     for track in sorted({item["track"] for item in records}):
         for task in ("objective", "reconstruction"):
             by_key: dict[tuple[str, int], dict[str, dict[str, Any]]] = defaultdict(dict)
@@ -344,16 +434,48 @@ def summarize(records: list[dict[str, Any]], seed: int = 9173) -> dict[str, Any]
                 if item["track"] == track and item["task"] == task and not item.get("failure"):
                     by_key[(item["case_id"], item["repetition"])][item["condition"]] = item
             metric_pairs: dict[str, list[tuple[float, float]]] = defaultdict(list)
+            metric_clusters: dict[str, dict[str, list[tuple[float, float]]]] = defaultdict(
+                lambda: defaultdict(list))
             for pair in by_key.values():
                 if set(pair) != {"airece", "ghidra"}: continue
                 left, right = pair["airece"], pair["ghidra"]
+                program_id = str(left.get("program_id", left["case_id"]))
                 if task == "objective":
-                    metric_pairs["accuracy"].append((left["score"]["accuracy"], right["score"]["accuracy"]))
+                    exact = (left["score"].get("exact_accuracy", 0.0),
+                             right["score"].get("exact_accuracy", 0.0))
+                    semantic = (left["score"]["semantic_accuracy"],
+                                right["score"]["semantic_accuracy"])
+                    metric_pairs["exact_accuracy"].append(exact)
+                    metric_pairs["semantic_accuracy"].append(semantic)
+                    metric_clusters["exact_accuracy"][program_id].append(exact)
+                    metric_clusters["semantic_accuracy"][program_id].append(semantic)
+                    artifact_exact = (left["score"].get("artifact_core_exact_accuracy", 0.0),
+                                      right["score"].get("artifact_core_exact_accuracy", 0.0))
+                    artifact_semantic = (
+                        left["score"].get("artifact_core_semantic_accuracy", 0.0),
+                        right["score"].get("artifact_core_semantic_accuracy", 0.0))
+                    metric_pairs["artifact_core_exact_accuracy"].append(artifact_exact)
+                    metric_pairs["artifact_core_semantic_accuracy"].append(artifact_semantic)
+                    metric_clusters["artifact_core_exact_accuracy"][program_id].append(
+                        artifact_exact)
+                    metric_clusters["artifact_core_semantic_accuracy"][program_id].append(
+                        artifact_semantic)
                 else:
-                    metric_pairs["behavioral_rate"].append((left["score"]["behavioral_rate"], right["score"]["behavioral_rate"]))
-                metric_pairs["total_tokens"].append((left["model"]["usage"]["total_tokens"],
-                                                      right["model"]["usage"]["total_tokens"]))
+                    behavioral = (left["score"]["behavioral_rate"],
+                                  right["score"]["behavioral_rate"])
+                    metric_pairs["behavioral_rate"].append(behavioral)
+                    metric_clusters["behavioral_rate"][program_id].append(behavioral)
+                tokens = (left["model"]["usage"]["total_tokens"],
+                          right["model"]["usage"]["total_tokens"])
+                metric_pairs["total_tokens"].append(tokens)
+                metric_clusters["total_tokens"][program_id].append(tokens)
             output["paired"][f"{track}/{task}"] = {
                 name: bootstrap_interval(pairs, seed + index)
                 for index, (name, pairs) in enumerate(sorted(metric_pairs.items()))}
+            output["clustered_paired"][f"{track}/{task}"] = {
+                name: bootstrap_interval([
+                    (sum(left for left, _ in values) / len(values),
+                     sum(right for _, right in values) / len(values))
+                    for values in clusters.values()], seed + 100 + index)
+                for index, (name, clusters) in enumerate(sorted(metric_clusters.items()))}
     return output

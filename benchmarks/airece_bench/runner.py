@@ -60,6 +60,15 @@ def _select_cases(cases: list[dict[str, Any]], config: dict[str, Any],
                 str(item.get("artifact_id", "")), item["case_id"]))
             selected.append(candidates[0])
         return selected[:max_cases] if max_cases > 0 else selected
+    if config.get("selection_balance_categories"):
+        rng = random.Random(config["corpus"]["seed"])
+        selected = []
+        for category in sorted({item.get("truth", {}).get("category") for item in cases}):
+            candidates = [item for item in cases
+                          if item.get("truth", {}).get("category") == category]
+            rng.shuffle(candidates)
+            selected.append(candidates[0])
+        return selected[:max_cases] if max_cases > 0 else selected
     shuffled = list(cases)
     random.Random(config["corpus"]["seed"]).shuffle(shuffled)
     return shuffled[:max_cases] if max_cases > 0 else shuffled
@@ -213,7 +222,8 @@ def _assert_semantic_context(category: str | None, context: dict[str, Any]) -> b
 
 def _preflight_targets(airece: pathlib.Path, cases: list[dict[str, Any]],
                        ghidra: GhidraExtractor, max_bytes: int,
-                       analyzer_timeout: float) -> list[dict[str, Any]]:
+                       analyzer_timeout: float,
+                       semantic_gate: bool = False) -> list[dict[str, Any]]:
     report: list[dict[str, Any]] = []
     failures: list[str] = []
     for case in cases:
@@ -236,11 +246,12 @@ def _preflight_targets(airece: pathlib.Path, cases: list[dict[str, Any]],
                 raise AssertionError("AIRECE function contains no decoded instructions")
             if envelope.get("omitted") or context.get("omitted", {}).get("facts"):
                 raise AssertionError("AIRECE agent context was truncated")
-            category = case.get("truth", {}).get("category")
-            semantic_check = _assert_semantic_context(category, context)
+            semantic_check = (_assert_semantic_context(
+                case.get("truth", {}).get("category"), context) if semantic_gate else None)
             row["airece"] = {"available": True, "bytes": len(raw.encode("utf-8")),
                              "instructions": context["function"]["instruction_count"],
-                             "semantic_check": semantic_check}
+                             "semantic_check": semantic_check,
+                             "semantic_gate_applied": semantic_gate}
 
             ghidra_backend = GhidraBackend(ghidra, binary, max_bytes)
             raw = ghidra_backend.execute("function_context", {
@@ -293,13 +304,23 @@ def _report(summary: dict[str, Any], manifest: dict[str, Any]) -> str:
                       f"{group.get('final_structure_valid', 0)} of {group['runs']}")
         lines.append(f"| {key} | {group['runs']} | {result} | "
                      f"{group['input_tokens']}/{group['output_tokens']} | {group['tool_calls']} |")
-    lines += ["", "## Paired differences (AIRECE minus Ghidra)", ""]
+    lines += ["", "## Paired case differences (AIRECE minus Ghidra)", ""]
     for key, metrics in summary.get("paired", {}).items():
         lines.append(f"### {key}")
         lines.append("")
         for name, value in metrics.items():
             lines.append(f"- {name}: {value['difference']} (paired bootstrap 95% CI "
                          f"{value['ci95']}, n={value['pairs']})")
+        lines.append("")
+    lines += ["## Program-clustered differences (AIRECE minus Ghidra)", "",
+              "Compiler/optimization variants of one source program are averaged before "
+              "bootstrap resampling.", ""]
+    for key, metrics in summary.get("clustered_paired", {}).items():
+        lines.append(f"### {key}")
+        lines.append("")
+        for name, value in metrics.items():
+            lines.append(f"- {name}: {value['difference']} (program-clustered bootstrap "
+                         f"95% CI {value['ci95']}, programs={value['pairs']})")
         lines.append("")
     lines += ["## Interpretation", "",
               "This report separates analyzer health from model usefulness. Missing or failed "
@@ -340,8 +361,19 @@ class BenchmarkRunner:
             repository = pathlib.Path(snapshot["path"])
             if git(repository, "status", "--porcelain"):
                 raise RuntimeError(f"repository is dirty at benchmark start: {name}")
-            if git(repository, "rev-parse", "HEAD") != snapshot["revision"]:
-                raise RuntimeError(f"repository revision changed since health report: {name}")
+            current_revision = git(repository, "rev-parse", "HEAD")
+            if current_revision != snapshot["revision"]:
+                if name != "airece":
+                    raise RuntimeError(f"repository revision changed since health report: {name}")
+                changed = git(repository, "diff", "--name-only",
+                              f"{snapshot['revision']}..{current_revision}")
+                changed_paths = [item for item in (changed or "").splitlines() if item]
+                allowed = all(item.startswith("benchmarks/") or
+                              item == "docs/benchmark-tool-instructions.md"
+                              for item in changed_paths)
+                if not changed_paths or not allowed:
+                    raise RuntimeError("AIRECE source changed after analyzer freeze: " +
+                                       ", ".join(changed_paths))
         corpus_manifest = build_corpus(self.root, self.config, self.output) if rebuild_corpus else \
             load_json(self.output / "corpus" / "manifest.json")
         if split not in {"development", "heldout"}:
@@ -355,7 +387,8 @@ class BenchmarkRunner:
         target_preflight = _preflight_targets(
             self.airece, cases, ghidra,
             self.config["budgets"]["max_tool_result_bytes"],
-            self.config["budgets"]["analyzer_timeout_seconds"])
+            self.config["budgets"]["analyzer_timeout_seconds"],
+            semantic_gate=split == "development")
         lm = LMStudioAdapter(self.config["model"], self.config["budgets"]["task_timeout_seconds"],
                              [str(self.root),
                               *(str(pathlib.Path(item["binary"]).parent) for item in cases),
@@ -363,12 +396,15 @@ class BenchmarkRunner:
         model_metadata = lm.probe()
         native_smoke = lm.native_chat_smoke()
         version = run(["lms", "--version"], self.root, 10)
-        analyzer_commit = git(self.root, "rev-parse", "HEAD")
+        harness_commit = git(self.root, "rev-parse", "HEAD")
+        analyzer_commit = health["repositories"]["airece"]["revision"]
         manifest = {"schema": "airece.ai-utility-manifest.v1", "status": "running",
             "created_unix": int(time.time()), "config": self.config,
             "config_sha256": sha256_file(self.config_path),
-            "analyzer": {"tag": "post-diagnostic-candidate", "commit": analyzer_commit,
-                         "harness_commit": git(self.root, "rev-parse", "HEAD"),
+            "analyzer": {"tag": "airece-agent-view-freeze-2026-08-11",
+                         "commit": analyzer_commit,
+                         "freeze_tag": "airece-agent-view-freeze-2026-08-11",
+                         "harness_commit": harness_commit,
                          "executable": str(self.airece),
                          "sha256": health["artifact"]["sha256"],
                          "version": health["artifact"]["version"],
@@ -459,6 +495,7 @@ class BenchmarkRunner:
                 **{key: job[key] for key in ("case_id", "repetition", "track", "task",
                                              "condition", "condition_order")},
                 "binary_sha256": case["binary_sha256"],
+                "program_id": case.get("program_id", case["case_id"]),
                 "target_address": case["target_address"],
                 "instruction_snapshot": prompt_snapshot(visible),
                 "tool_schema_snapshot": {"sha256": identity["schema"],
@@ -479,7 +516,7 @@ class BenchmarkRunner:
                 record["ghidra_extraction"] = extraction
                 def execute_tool(name: str, arguments: dict[str, Any]) -> str:
                     return backend.execute(name, arguments, job["track"])
-                if job["track"] == "common":
+                if job["track"] == "single":
                     context = execute_tool("function_context", {
                         "address": case["target_address"], "level": "primary"})
                     context_event = {"name": "function_context", "arguments": {
@@ -503,6 +540,21 @@ class BenchmarkRunner:
                     model = lm.run_tools(visible, task_prompt, schemas,
                         execute_tool, self.config["budgets"]["max_tool_calls"],
                         self.config["budgets"]["max_input_bytes"])
+                if job["track"] != "single":
+                    raw_final = model["final_text"]
+                    normalized_final = _normalize_direct_final(job["task"], raw_final)
+                    model["raw_final_text"] = raw_final
+                    model["raw_validation_errors"] = _validate_direct_final(
+                        job["task"], raw_final)
+                    model["final_text"] = normalized_final
+                    model["final_validation_errors"] = _validate_direct_final(
+                        job["task"], normalized_final)
+                    model["normalizations"] = ([{"input_size": len(raw_final.encode("utf-8")),
+                        "output_size": len(normalized_final.encode("utf-8"))}]
+                        if normalized_final != raw_final else [])
+                    model["repair_attempted"] = normalized_final != raw_final
+                    model["repair_succeeded"] = (normalized_final != raw_final and
+                        not model["final_validation_errors"])
                 record["model"] = model
                 if job["task"] == "objective":
                     record["raw_score"] = score_objective(

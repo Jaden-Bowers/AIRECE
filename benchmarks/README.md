@@ -1,9 +1,11 @@
 # AIRECE AI-utility benchmark harness
 
 This harness measures a frozen local model against the frozen AIRECE analyzer
-and Ghidra 12.1.2 headless. It implements blinded common-capability and matched
-native-agent tracks, objective JSON scoring, source reconstruction with hidden
-behavioral tests, atomic resumable records, and paired bootstrap intervals.
+and Ghidra 12.1.2 headless. It implements three distinct tiers: a blinded
+single-context representation test, a blinded common-agentic tool test, and a
+matched native-agentic test. It includes objective JSON scoring, source
+reconstruction with hidden behavioral tests, atomic resumable records, and both
+case-paired and source-program-clustered bootstrap intervals.
 
 Load `prism-ml/bonsai-27b` in LM Studio with the checked-in 16,384-token context
 length before running. The benchmark preflight records the native model metadata.
@@ -51,8 +53,18 @@ Resume the same run without rebuilding the corpus:
 python -m benchmarks.airece_bench.cli --split development --max-cases 2 --repetitions 1 --no-rebuild-corpus
 ```
 
-A detached 20-case held-out run with three repetitions, only after development
-smoke transcripts pass leakage review:
+A category-balanced tiered held-out run with one repetition, only after
+development smoke transcripts pass leakage review:
+
+```powershell
+python -m benchmarks.airece_bench.cli --dry-run --split heldout `
+  --balanced-categories --max-cases 20 --repetitions 1
+python -m benchmarks.airece_bench.cli --split heldout `
+  --balanced-categories --max-cases 20 --repetitions 1
+```
+
+A detached 20-case run with three repetitions is reserved for the final frozen
+evaluation:
 
 ```powershell
 python benchmarks/launch_detached.py --max-cases 20 --repetitions 3

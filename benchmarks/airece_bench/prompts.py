@@ -96,9 +96,9 @@ def prompt_snapshot(text: str) -> dict[str, Any]:
 
 def validate_isolation(sections: dict[str, str], visible: str, track: str,
                        condition: str, forbidden: list[str]) -> None:
-    if track == "common":
+    if track in {"single", "common"}:
         if visible != sections["common"]:
-            raise ValueError("common prompt is not byte-identical")
+            raise ValueError("blinded prompt is not byte-identical")
         if sections["airece"] in visible or sections["ghidra"] in visible:
             raise ValueError("native instruction pack leaked into common track")
     else:
@@ -115,5 +115,5 @@ def validate_isolation(sections: dict[str, str], visible: str, track: str,
 
 
 def instructions(sections: dict[str, str], track: str, condition: str) -> str:
-    return sections["common"] if track == "common" else \
+    return sections["common"] if track in {"single", "common"} else \
         sections["common"] + "\n" + sections[condition]

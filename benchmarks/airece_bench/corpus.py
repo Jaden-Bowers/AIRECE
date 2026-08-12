@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import random
 import struct
 import sys
 from typing import Any, Callable
 
-from .util import atomic_write_json, load_json, resolve, run, sha256_file
+from .util import atomic_write_json, load_json, resolve, run, sha256_bytes, sha256_file
 
 
 MASK = 0xffffffff
@@ -128,6 +129,11 @@ CONTROL_SHAPES = {
 TEST_INPUTS = [(0, 0), (1, 2), (3, 4), (9, 100), (17, 0xffffffff),
                (0x12345678, 31), (0xffffffff, 1), (6, 101), (8, 7),
                (0x80000000, 0x10203040)]
+_test_rng = random.Random(0xA1ECE)
+while len(TEST_INPUTS) < 64:
+    candidate = (_test_rng.getrandbits(32), _test_rng.getrandbits(32))
+    if candidate not in TEST_INPUTS:
+        TEST_INPUTS.append(candidate)
 
 
 def pe_exports(path: pathlib.Path) -> dict[str, str]:
@@ -291,6 +297,7 @@ def build(root: pathlib.Path, config: dict[str, Any], output: pathlib.Path) -> d
                     bias = next_bias
             cases.append({"case_id": case_id, "split": "development" if function_name in
                           {"f_19a7d3e1", "f_60ac2836"} else "heldout",
+                          "program_id": sha256_bytes(function_name.encode("utf-8"))[:12],
                           "artifact_id": artifact["id"], "binary": artifact["path"],
                           "binary_sha256": artifact["sha256"], "target_address": address,
                           "opaque_symbol": function_name, "truth": truth,

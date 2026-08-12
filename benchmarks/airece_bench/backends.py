@@ -18,13 +18,16 @@ COMMON_TOOLS = [
                     "additionalProperties": False}},
     {"type": "function", "name": "function_context", "description": "Get primary or low-level context for a function.",
      "parameters": {"type": "object", "properties": {"address": {"type": "string"},
-                    "level": {"type": "string", "enum": ["primary", "low_level"]}},
+                    "level": {"type": "string", "enum": ["primary", "low_level"]},
+                    "limit": {"type": "integer", "minimum": 16, "maximum": 256}},
                     "required": ["address", "level"], "additionalProperties": False}},
     {"type": "function", "name": "calls", "description": "Get calls made by a function.",
-     "parameters": {"type": "object", "properties": {"address": {"type": "string"}},
+     "parameters": {"type": "object", "properties": {"address": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 256}},
                     "required": ["address"], "additionalProperties": False}},
     {"type": "function", "name": "xrefs", "description": "Get references to or from an address.",
-     "parameters": {"type": "object", "properties": {"address": {"type": "string"}},
+     "parameters": {"type": "object", "properties": {"address": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 256}},
                     "required": ["address"], "additionalProperties": False}},
 ]
 
@@ -33,7 +36,8 @@ AIRECE_NATIVE_TOOLS = [COMMON_TOOLS[0],
     {**COMMON_TOOLS[1], "name": "functions"},
     {"type": "function", "name": "fn", "description": "Render an AIRECE function view.",
      "parameters": {"type": "object", "properties": {"address": {"type": "string"},
-        "view": {"type": "string", "enum": ["agent", "compact", "json", "pseudo", "ir"]}},
+        "view": {"type": "string", "enum": ["agent", "compact", "json", "pseudo", "ir"]},
+        "limit": {"type": "integer", "minimum": 16, "maximum": 256}},
         "required": ["address", "view"], "additionalProperties": False}},
     COMMON_TOOLS[3], COMMON_TOOLS[4],
     {"type": "function", "name": "evidence", "description": "Resolve an AIRECE evidence or statement identifier.",
@@ -54,13 +58,14 @@ AIRECE_NATIVE_TOOLS = [COMMON_TOOLS[0],
 
 GHIDRA_NATIVE_TOOLS = [COMMON_TOOLS[0], COMMON_TOOLS[1], COMMON_TOOLS[2],
     {"type": "function", "name": "disassembly", "description": "Get bounded function disassembly.",
-     "parameters": {"type": "object", "properties": {"address": {"type": "string"}},
+     "parameters": {"type": "object", "properties": {"address": {"type": "string"},
+        "limit": {"type": "integer", "minimum": 16, "maximum": 256}},
                     "required": ["address"], "additionalProperties": False}},
     COMMON_TOOLS[3], COMMON_TOOLS[4]]
 
 
 def tool_schema(track: str, condition: str) -> list[dict[str, Any]]:
-    if track == "common":
+    if track in {"single", "common"}:
         return json.loads(json.dumps(COMMON_TOOLS))
     return json.loads(json.dumps(AIRECE_NATIVE_TOOLS if condition == "airece"
                                  else GHIDRA_NATIVE_TOOLS))
@@ -125,18 +130,21 @@ class AireceBackend(Backend):
         self.timeout = timeout
 
     def _execute(self, name: str, arguments: dict[str, Any], track: str) -> str:
-        if track == "common":
+        if track in {"single", "common"}:
             name = {"list_functions": "functions", "function_context": "fn"}.get(name, name)
         command = [str(self.executable)]
         if name == "inspect": command += ["inspect", str(self.binary), "--profile", "balanced"]
         elif name == "functions": command += ["functions", str(self.binary), "--profile", "balanced"]
         elif name == "fn":
             view = arguments.get("view") or ("agent" if arguments.get("level") == "primary" else "ir")
+            limit = min(max(int(arguments.get("limit", 256)), 16), 256)
             command += ["fn", str(self.binary), str(arguments["address"]), "--view", view,
                         "--profile", "fast", "--max-bytes", str(self.max_bytes),
-                        "--max-statements", "256", "--max-evidence", "256"]
+                        "--max-statements", str(limit), "--max-evidence", str(limit)]
         elif name in {"calls", "xrefs"}:
             command += [name, str(self.binary), str(arguments["address"])]
+            if name == "calls":
+                command += ["--max-calls", str(min(max(int(arguments.get("limit", 256)), 1), 256))]
         elif name in {"evidence", "slice"}:
             command += [name, str(self.binary), str(arguments["locator"])]
         elif name == "path":
@@ -190,10 +198,18 @@ class GhidraBackend(Backend):
                         "decompile_ok", "decompile_truncated", "decompiled_c") if \
                     level == "primary" else ("entry", "name", "signature", "instructions")
                 value = {key: function[key] for key in keys}
-            elif name == "disassembly": value = function["instructions"]
-            elif name == "calls": value = function["calls"]
+                if level == "low_level":
+                    value["instructions"] = value["instructions"][:min(
+                        max(int(arguments.get("limit", 256)), 16), 256)]
+            elif name == "disassembly": value = function["instructions"][:min(
+                max(int(arguments.get("limit", 256)), 16), 256)]
+            elif name == "calls": value = function["calls"][:min(
+                max(int(arguments.get("limit", 256)), 1), 256)]
             else: value = {"to_function": function["xrefs_to"],
                            "from_function_calls": function["calls"]}
+            if name == "xrefs":
+                limit = min(max(int(arguments.get("limit", 256)), 1), 256)
+                value = {key: items[:limit] for key, items in value.items()}
         else:
             return canonical_json({"ok": False, "error": "unavailable tool"})
         return self._bounded({"ok": True,

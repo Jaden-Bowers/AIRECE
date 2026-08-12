@@ -12,18 +12,22 @@ fallback. Native-agent tool schemas are passed through LM Studio's
 `/v1/responses` function-tool interface. The prompt text below must be supplied
 as condition instructions; do not assume the model retained it between runs.
 
-Run two complementary comparisons:
+Run three complementary comparisons:
 
-1. **Common-capability, blinded track.** Present the same abstract operations
+1. **Single-context, blinded track.** Give the model exactly one predetermined
+   primary function context: AIRECE's agent view or Ghidra's decompiled C. This
+   isolates the utility of each default high-level representation.
+2. **Common-agentic, blinded track.** Present the same abstract operations
    (`inspect`, `list_functions`, `function_context`, `calls`, and `xrefs`) and
    the same common prompt. The harness routes them to AIRECE or Ghidra without
-   revealing which backend is active. This best isolates context quality.
-2. **Native-agent track.** Identify the tool and provide its complete matched
+   revealing which backend is active. The model chooses primary or low-level
+   context, bounded record limits, calls, and references within the same budget.
+3. **Native-agent track.** Identify the tool and provide its complete matched
    instruction pack below. AIRECE may expose evidence, slicing, paths, and flow;
    Ghidra may expose decompilation, disassembly, references, and its analysis
    metadata. This measures realistic product usefulness.
 
-Both tracks must use the same answer schema, model settings, context and output
+All tracks must use the same answer schema, model settings, context and output
 limits, tool-call limit, wall-time limit, case order, and empty starting
 context. Do not add claims about which tool is newer, more accurate, or expected
 to win. The harness should render a machine-generated tool schema after the
@@ -53,14 +57,16 @@ v0.10.0-benchmark-rc1. AIRECE is a bounded, AI-oriented static context engine
 for PE/x86-64 binaries. XAIR is its sole semantic IR. AIRECE deliberately emits
 unknown, opaque, partial, or unresolved information instead of guessing.
 
-Start with `inspect` to learn the image base, entry point, discovery counts, and
-completeness. Use `functions` to enumerate recovered functions. For a target
-function, prefer `fn --view json` when you need machine-readable statements,
-stable IDs, control transfers, coverage, and evidence; prefer `fn --view
-compact` for a shorter semantic summary; use `fn --view pseudo` only as a
-presentation aid. Pseudocode is conservative and may retain qualified labels
-and gotos when a high-level region cannot be certified. `fn --view ir` exposes
-the underlying XAIR when presentation has omitted a needed detail.
+Start with `inspect` when program-wide completeness matters, and use `functions`
+only when the target is unknown. For a supplied target, prefer `fn --view agent`
+for a bounded digest of parameters, returns, conditions, switches, calls, and
+memory effects. Request `fn --view json` when you need machine-readable
+statements, stable IDs, control transfers, coverage, and evidence; use `fn
+--view compact` or `pseudo` as presentation aids. Pseudocode is conservative
+and may retain qualified labels and gotos when a high-level region cannot be
+certified. `fn --view ir` exposes the underlying XAIR when a higher-level view
+has omitted a needed detail. Use the smallest sufficient record limit and
+increase it only when the response reports omitted facts.
 
 Use `calls` for call sites, modeled APIs, effects, and taint roles. Use `xrefs`
 for code/data references. Use `evidence` with a full function-qualified

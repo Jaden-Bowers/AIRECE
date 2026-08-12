@@ -34,6 +34,7 @@ class PromptTests(unittest.TestCase):
         right = canonical_json(tool_schema("common", "ghidra"))
         self.assertEqual(left, right)
         self.assertEqual(sha256_bytes(left.encode()), sha256_bytes(right.encode()))
+        self.assertEqual(left, canonical_json(tool_schema("single", "airece")))
 
     def test_instruction_pack_isolation_and_hashing(self) -> None:
         common = instructions(self.sections, "common", "airece")
@@ -96,8 +97,8 @@ class ParserScoringTests(unittest.TestCase):
         truth.pop("memory_writes")
         score = score_objective(json.dumps(answer), truth,
             [{"result": "addresses 0x1000 and 0x1001"}], 0x1000, 0x1010)
-        # An empty no-switch set is not awarded as a recovered semantic fact.
-        self.assertEqual(score["fields_correct"], score["fields_total"] - 1)
+        # An explicitly answered empty no-switch set is a meaningful correct result.
+        self.assertEqual(score["fields_correct"], score["fields_total"])
         self.assertEqual(score["evidence_valid"], 2)
 
         unknown = json.loads(json.dumps(answer))
@@ -109,6 +110,10 @@ class ParserScoringTests(unittest.TestCase):
 
         malformed = {"answers": [{"question_id": "q1"}]}
         self.assertTrue(validate_objective(malformed))
+        wrong_type = json.loads(json.dumps(answer))
+        wrong_type["answers"][0]["parameter_count"] = "two"
+        wrong_type["answers"][0]["category"] = "invented"
+        self.assertGreaterEqual(len(validate_objective(wrong_type)), 2)
 
     def test_source_extraction(self) -> None:
         function, error = extract_c_function(
@@ -154,6 +159,17 @@ class CorpusTests(unittest.TestCase):
                   "corpus": {"seed": 1}}
         self.assertEqual([item["case_id"] for item in _select_cases(cases, config, 5)],
                          ["preferred", "global"])
+
+    def test_balanced_selection_uses_one_case_per_category(self) -> None:
+        cases = [
+            {"case_id": "a1", "truth": {"category": "a"}},
+            {"case_id": "a2", "truth": {"category": "a"}},
+            {"case_id": "b1", "truth": {"category": "b"}},
+        ]
+        config = {"selection_balance_categories": True, "corpus": {"seed": 9}}
+        selected = _select_cases(cases, config, 20)
+        self.assertEqual(len(selected), 2)
+        self.assertEqual({item["truth"]["category"] for item in selected}, {"a", "b"})
 
     def test_semantic_contract_covers_every_category(self) -> None:
         dense_results = ["arg1 + 0xb", "arg1 * 3", "arg1 - 0x13",
@@ -225,8 +241,23 @@ class ResumeTests(unittest.TestCase):
             "failure": {"type": "Unavailable", "message": "offline"},
         }])
         group = result["groups"]["common/airece/objective"]
-        self.assertEqual(group["rates"]["objective_accuracy"], 0.0)
+        self.assertEqual(group["rates"]["objective_exact_accuracy"], 0.0)
+        self.assertEqual(group["rates"]["objective_semantic_accuracy"], 0.0)
         self.assertEqual(group["rates"]["explicit_unknown"], 0.0)
+
+    def test_program_clustered_summary_averages_compiler_variants(self) -> None:
+        records = []
+        for case_id, left, right in (("variant-a", 1.0, 0.0),
+                                     ("variant-b", 0.0, 0.0)):
+            for condition, rate in (("airece", left), ("ghidra", right)):
+                records.append({"run_id": case_id + condition, "case_id": case_id,
+                    "program_id": "same-program", "repetition": 0, "track": "single",
+                    "task": "reconstruction", "condition": condition,
+                    "model": {"usage": {"total_tokens": 1}},
+                    "score": {"behavioral_rate": rate}})
+        clustered = summarize(records)["clustered_paired"]["single/reconstruction"]
+        self.assertEqual(clustered["behavioral_rate"]["pairs"], 1)
+        self.assertEqual(clustered["behavioral_rate"]["difference"], 0.5)
 
 
 class ToolBudgetTests(unittest.TestCase):
