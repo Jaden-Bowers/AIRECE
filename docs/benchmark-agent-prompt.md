@@ -24,7 +24,7 @@ Locations
   C:\Users\Jaden\Desktop\Projects\AIRECE\docs\benchmark-tool-instructions.md
 
 The analyzer under test is the annotated Git tag
-v0.11.0-benchmark-rc1. Treat that tag and its dependency revisions as
+v0.11.0-benchmark-rc2. Treat that tag and its dependency revisions as
 immutable. Do not fix, reformat, or otherwise change analyzer implementation
 code while benchmarking. Build harness work on a separate branch such as
 benchmark-harness, or in a separate AIRECE-benchmarks directory. Every run must

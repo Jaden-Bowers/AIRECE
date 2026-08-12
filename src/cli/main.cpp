@@ -18,6 +18,7 @@
 #include <limits>
 #include <queue>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -97,7 +98,7 @@ void print_help() {
         << "  --no-repeated-values\n"
         << "  --no-buffers\n\n"
         << "Semantic function options:\n"
-        << "  --view <agent|compact|pseudo|ir|json>\n"
+        << "  --view <agent|compact|pseudo|disassembly|ir|json>\n"
         << "  --json (alias for --view json)\n"
         << "  --max-bytes <count>\n"
         << "  --max-statements <count>\n"
@@ -318,7 +319,7 @@ bool parse_analysis_options(
             if (!assign_size(option, value, compact_options->call_offset)) return false;
         } else if (semantic_view != nullptr && option == "--view") {
             if (value != "agent" && value != "compact" && value != "pseudo" &&
-                value != "ir" && value != "json") {
+                value != "disassembly" && value != "ir" && value != "json") {
                 std::cerr << "airece: unsupported function view: " << value << '\n';
                 return false;
             }
@@ -356,6 +357,124 @@ bool is_complete(const airece::AnalysisSession& session) {
 
 void print_hex(const std::uint64_t value) {
     std::cout << "0x" << std::hex << value << std::dec;
+}
+
+std::string disassembly_operand(const xair_x86_operand& operand) {
+    std::ostringstream out;
+    switch (operand.kind) {
+    case XAIR_X86_OPERAND_REGISTER:
+        out << xair_x86_reg_name(operand.value.reg.parent) << ':' << operand.size_bits;
+        break;
+    case XAIR_X86_OPERAND_IMMEDIATE:
+        out << "0x" << std::hex << operand.value.imm << std::dec;
+        break;
+    case XAIR_X86_OPERAND_MEMORY: {
+        const xair_x86_memory_operand& memory = operand.value.mem;
+        out << '[';
+        bool term = false;
+        if (memory.kind == XAIR_X86_MEM_RIP_REL) {
+            out << "rip";
+            term = true;
+        } else if (memory.has_base != 0) {
+            out << xair_x86_reg_name(memory.base.parent);
+            term = true;
+        }
+        if (memory.has_index != 0) {
+            if (term) out << '+';
+            out << xair_x86_reg_name(memory.index.parent);
+            if (memory.scale > 1) out << '*' << static_cast<unsigned>(memory.scale);
+            term = true;
+        }
+        if (memory.displacement != 0 || !term) {
+            if (term && memory.displacement >= 0) out << '+';
+            if (memory.displacement < 0) {
+                const auto magnitude = static_cast<std::uint64_t>(
+                    -(memory.displacement + 1)) + 1;
+                out << "-0x" << std::hex << magnitude << std::dec;
+            } else {
+                out << "0x" << std::hex << memory.displacement << std::dec;
+            }
+        }
+        out << "]:" << operand.size_bits;
+        break;
+    }
+    case XAIR_X86_OPERAND_POINTER:
+        out << "ptr(" << operand.value.ptr.segment << ":0x" << std::hex <<
+            operand.value.ptr.offset << std::dec << ')';
+        break;
+    default: out << "unknown"; break;
+    }
+    return out.str();
+}
+
+std::string render_disassembly(
+    const airece::AnalysisSession& session,
+    const airece::FunctionInfo& function,
+    const std::size_t max_instructions,
+    const std::size_t max_bytes) {
+    std::size_t node_count = 0;
+    const xair_cfg_node_id* node_ids = xair_cfg_function_nodes(
+        &session.cfg(), function.id, &node_count);
+    std::vector<const xair_cfg_node*> nodes;
+    for (std::size_t index = 0; index < node_count; ++index) {
+        if (const xair_cfg_node* node = xair_cfg_get_node(&session.cfg(), node_ids[index])) {
+            nodes.push_back(node);
+        }
+    }
+    std::sort(nodes.begin(), nodes.end(), [](const auto* left, const auto* right) {
+        return left->start < right->start;
+    });
+    std::string output;
+    std::size_t emitted = 0;
+    std::size_t omitted = 0;
+    for (const xair_cfg_node* node : nodes) {
+        for (std::uint64_t address = node->start; address < node->end;) {
+            xair_x86_decoded_inst instruction{};
+            if (xair_decode_instruction(&session.binary(), address, &instruction) != XAIR_OK ||
+                instruction.length == 0) break;
+            if (emitted >= max_instructions) {
+                ++omitted;
+                address += instruction.length;
+                continue;
+            }
+            std::ostringstream line;
+            line << "0x" << std::hex << address << std::dec << ": ";
+            for (std::size_t byte = 0; byte < instruction.length; ++byte) {
+                if (byte != 0) line << ' ';
+                line << std::hex << std::setw(2) << std::setfill('0') <<
+                    static_cast<unsigned>(instruction.bytes[byte]) << std::dec;
+            }
+            line << "  " << xair_x86_decoder_mnemonic_name(instruction.decoder_mnemonic);
+            for (std::size_t operand = 0;
+                 operand < instruction.visible_operand_count; ++operand) {
+                line << (operand == 0 ? " " : ", ") <<
+                    disassembly_operand(instruction.operands[operand]);
+            }
+            if (instruction.branch_target_valid != 0) {
+                line << " -> 0x" << std::hex << instruction.branch_target << std::dec;
+            }
+            line << '\n';
+            const std::string record = line.str();
+            // Reserve enough room for the omission record so truncation always
+            // happens between complete instruction lines.
+            constexpr std::size_t footer_reserve = 48;
+            if (max_bytes != 0 &&
+                (max_bytes <= footer_reserve ||
+                 output.size() + record.size() > max_bytes - footer_reserve)) {
+                ++omitted;
+            } else {
+                output += record;
+                ++emitted;
+            }
+            address += instruction.length;
+        }
+    }
+    if (omitted != 0) {
+        const std::string footer =
+            "omitted-instructions: " + std::to_string(omitted) + '\n';
+        if (max_bytes == 0 || output.size() + footer.size() <= max_bytes) output += footer;
+    }
+    return output;
 }
 
 int report_open_failure(const airece::SessionDiagnostic& diagnostic) {
@@ -609,6 +728,12 @@ int function_command(const int argc, char** argv) {
             *context, semantic,
             enrichment_options);
         airece::append_enrichment(semantic, enrichment);
+    }
+    if (view_name == "disassembly") {
+        std::cout << render_disassembly(
+            *opened.session, *function, compact_options.max_statements,
+            compact_options.max_bytes);
+        return is_complete(*opened.session) ? exit_success : exit_partial;
     }
     if (view_name == "ir") {
         std::cout << airece::render_function_ir(opened.session->cfg(),

@@ -52,7 +52,7 @@ source code.
 
 ```text
 The active analysis tool is AIRECE v0.11.0 benchmark freeze
-v0.11.0-benchmark-rc1. AIRECE is a bounded, AI-oriented static context engine
+v0.11.0-benchmark-rc2. AIRECE is a bounded, AI-oriented static context engine
 for PE/x86-64 binaries. XAIR is its sole semantic IR. AIRECE deliberately emits
 unknown, opaque, partial, or unresolved information instead of guessing.
 
@@ -63,7 +63,7 @@ one-hop callee summaries, and recursive helpers to recurrences when present. It 
 parameters, returns, switches, calls, state updates, and memory effects. Use `fn`
 to obtain the same agent digest only for a newly followed callee. Use
 `fn_detail` only when the supplied digest lacks one fact required by the task;
-select the narrowest compact, JSON, pseudo, or IR view and a limit no larger
+select the narrowest compact, JSON, pseudo, disassembly, or IR view and a limit no larger
 than 64. Do not request `inspect` or enumerate functions when a target address
 is already supplied. Analyzer temporaries and memory primitives are evidence,
 not source code, and must never be copied into a reconstruction.
@@ -95,7 +95,8 @@ Important output rules:
 Recommended workflow: read the supplied agent digest; answer immediately when
 it is sufficient; otherwise make one narrow calls, xrefs, evidence, slice, or
 `fn_detail` request; follow a callee with `fn` only when its behavior is needed;
-then answer. Common-track low-level context is bounded pseudocode rather than raw IR.
+then answer. Common-track low-level context combines bounded pseudocode and addressed
+instruction records rather than returning raw IR.
 Exact duplicate requests end tool selection. Use flow, path, or IR
 only for a specific unresolved dependency or feasibility question.
 ```

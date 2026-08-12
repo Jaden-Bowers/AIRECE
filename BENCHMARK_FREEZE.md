@@ -1,6 +1,6 @@
 # AIRECE benchmark freeze
 
-Freeze identifier: `v0.11.0-benchmark-rc1`
+Freeze identifier: `v0.11.0-benchmark-rc2`
 
 This release candidate is the immutable AIRECE target for the next analyzer and
 AI-utility benchmark. The earlier v0.10.0 tag remains the diagnostic baseline.

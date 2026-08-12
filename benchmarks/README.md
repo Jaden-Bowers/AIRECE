@@ -8,7 +8,7 @@ reconstruction with hidden behavioral tests, atomic resumable records, and both
 case-paired and source-program-clustered bootstrap intervals.
 
 In the common track, AIRECE `primary` context is the bounded agent digest and
-`low_level` context is bounded pseudocode. Raw IR remains an explicit native
+`low_level` context combines bounded pseudocode with addressed instruction records. Raw IR remains an explicit native
 `fn_detail` choice. Text results are trimmed only at complete line boundaries
 and include omission and continuation metadata.
 

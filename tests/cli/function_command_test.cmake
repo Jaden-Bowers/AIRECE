@@ -43,6 +43,25 @@ foreach(_required IN ITEMS "if (" "F140001000_L" "goto F140001000_L")
 endforeach()
 
 execute_process(
+    COMMAND ${_base} --view disassembly --max-bytes 700 --max-statements 3
+    RESULT_VARIABLE _disassembly_result
+    OUTPUT_VARIABLE _disassembly
+    ERROR_VARIABLE _disassembly_error)
+if(NOT _disassembly_result EQUAL 0 AND NOT _disassembly_result EQUAL 3)
+    message(FATAL_ERROR "disassembly fn failed (${_disassembly_result}): ${_disassembly_error}")
+endif()
+foreach(_required IN ITEMS "0x140001000:" "omitted-instructions:")
+    string(FIND "${_disassembly}" "${_required}" _found)
+    if(_found EQUAL -1)
+        message(FATAL_ERROR "disassembly output lacks '${_required}':\n${_disassembly}")
+    endif()
+endforeach()
+string(LENGTH "${_disassembly}" _disassembly_length)
+if(_disassembly_length GREATER 700)
+    message(FATAL_ERROR "disassembly output exceeds byte budget: ${_disassembly_length}")
+endif()
+
+execute_process(
     COMMAND ${_base} --view compact --max-bytes 220 --max-statements 1 --max-evidence 1
     RESULT_VARIABLE _bounded_result
     OUTPUT_VARIABLE _bounded

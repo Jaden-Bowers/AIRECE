@@ -6,7 +6,7 @@ int main() {
     const std::string version = airece::version_text();
     const std::string required[] = {
         "AIRECE 0.11.0",
-        "benchmark-freeze v0.11.0-benchmark-rc1",
+        "benchmark-freeze v0.11.0-benchmark-rc2",
         "xair 0.3.0",
         "xair_cfg 0.2.0",
         "xair_sym 0.6.0",

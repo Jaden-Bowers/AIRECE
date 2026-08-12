@@ -41,7 +41,7 @@ AIRECE_NATIVE_TOOLS = [
     {"type": "function", "name": "fn_detail", "description":
         "Get a bounded lower-level view only when the supplied agent digest lacks a needed fact.",
      "parameters": {"type": "object", "properties": {"address": {"type": "string"},
-        "view": {"type": "string", "enum": ["compact", "json", "pseudo", "ir"]},
+        "view": {"type": "string", "enum": ["compact", "json", "pseudo", "disassembly", "ir"]},
         "limit": {"type": "integer", "minimum": 16, "maximum": 64}},
         "required": ["address", "view"], "additionalProperties": False}},
     COMMON_TOOLS[3], COMMON_TOOLS[4],
@@ -103,6 +103,7 @@ class Backend:
                     continue
             lists: list[list[Any]] = []
             fields: list[tuple[dict[str, Any], str]] = []
+            record_fields: list[tuple[dict[str, Any], str]] = []
             def collect(item: Any) -> None:
                 if isinstance(item, list):
                     if item:
@@ -113,9 +114,23 @@ class Backend:
                     for key, child in item.items():
                         if isinstance(child, str) and key not in {"entry", "name", "error"}:
                             fields.append((item, key))
+                            if len(child.splitlines(keepends=True)) > 1:
+                                record_fields.append((item, key))
                         collect(child)
             collect(value)
-            if lists:
+            if record_fields:
+                owner, key = max(record_fields,
+                    key=lambda item: len(item[0][item[1]].encode("utf-8")))
+                lines = owner[key].splitlines(keepends=True)
+                lines.pop()
+                owner[key] = "".join(lines)
+                omitted += 1
+                if isinstance(value, dict):
+                    value["omitted"] = {"records": omitted}
+                    value["continuation"] = {"available": True, "kind": "line"}
+                rendered = canonical_json(value)
+                continue
+            elif lists:
                 max(lists, key=lambda item: len(canonical_json(item[-1]).encode("utf-8"))).pop()
             elif fields:
                 owner, key = max(fields, key=lambda item: len(item[0][item[1]].encode("utf-8")))
@@ -160,6 +175,8 @@ class AireceBackend(Backend):
         if name == "inspect": command += ["inspect", str(self.binary), "--profile", "balanced"]
         elif name == "functions": command += ["functions", str(self.binary), "--profile", "balanced"]
         elif name in {"fn", "fn_detail"}:
+            common_low_level = (requested_name == "function_context" and
+                                arguments.get("level") == "low_level")
             view = (str(arguments["view"]) if requested_name == "fn_detail" else
                     ("agent" if requested_name == "fn" and "level" not in arguments else
                      ("agent" if arguments.get("level") == "primary" else "pseudo")))
@@ -167,6 +184,23 @@ class AireceBackend(Backend):
             command += ["fn", str(self.binary), str(arguments["address"]), "--view", view,
                         "--profile", "fast", "--max-bytes", str(self.max_bytes),
                         "--max-statements", str(limit), "--max-evidence", str(limit)]
+            if common_low_level:
+                pseudo = run(command, self.binary.parent, self.timeout)
+                disassembly_command = list(command)
+                disassembly_command[disassembly_command.index("--view") + 1] = "disassembly"
+                disassembly = run(disassembly_command, self.binary.parent, self.timeout)
+                failures = [result["exit"] for result in (pseudo, disassembly)
+                            if result["exit"] not in (0, 3)]
+                combined_exit = failures[0] if failures else (
+                    3 if pseudo["exit"] == 3 or disassembly["exit"] == 3 else 0)
+                return self._bounded({
+                    "ok": pseudo["exit"] in (0, 3) and disassembly["exit"] in (0, 3),
+                    "partial": pseudo["exit"] == 3 or disassembly["exit"] == 3,
+                    "exit": combined_exit,
+                    "elapsed_ms": pseudo["elapsed_ms"] + disassembly["elapsed_ms"],
+                    "result": {"pseudo": pseudo["stdout"],
+                               "disassembly": disassembly["stdout"]},
+                    "stderr": (pseudo["stderr"] + disassembly["stderr"])[-1000:]})
         elif name in {"calls", "xrefs"}:
             command += [name, str(self.binary), str(arguments["address"])]
             if name == "calls":

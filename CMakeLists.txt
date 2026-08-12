@@ -9,7 +9,7 @@ project(AIRECE VERSION 0.11.0 LANGUAGES C CXX)
 # This identifier is intentionally independent of the semantic/flow schema
 # versions.  Benchmark reports require it so results cannot silently mix
 # binaries built before and after the release-candidate freeze.
-set(AIRECE_BENCHMARK_FREEZE "v0.11.0-benchmark-rc1")
+set(AIRECE_BENCHMARK_FREEZE "v0.11.0-benchmark-rc2")
 
 # CMake projects configured before CMP0184 may retain /RTC1 in cached Debug
 # flags.  Move that setting to the target property so the CRT-free compiler

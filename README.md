@@ -133,7 +133,7 @@ These apply to `fn`.
 
 | Flag | Meaning |
 |---|---|
-| `--view <agent\|compact\|pseudo\|ir\|json>` | Selects the output. `agent` is a small behavioral digest, `compact` is bounded semantic text, `pseudo` adds conservative structured control flow, `ir` exposes lifted operations, and `json` emits `airece.semantic.v1`. |
+| `--view <agent\|compact\|pseudo\|disassembly\|ir\|json>` | Selects the output. `agent` is a small behavioral digest, `compact` is bounded semantic text, `pseudo` adds conservative structured control flow, `disassembly` emits bounded addressed instruction records, `ir` exposes lifted operations, and `json` emits `airece.semantic.v1`. |
 | `--json` | Alias for `--view json`. |
 | `--max-bytes <count>` | Maximum output bytes. |
 | `--max-statements <count>` | Maximum statements returned. |
@@ -204,6 +204,7 @@ A selector may have a stable name, for example
 airece inspect sample.exe --profile balanced
 airece fn sample.exe 0x140001000 --view agent
 airece fn sample.exe 0x140001000 --view pseudo --max-bytes 8192
+airece fn sample.exe 0x140001000 --view disassembly --max-statements 64
 airece calls sample.exe 0x140001000
 airece slice sample.exe F140001000:S:O16
 airece evidence sample.exe F140001000:S:O16

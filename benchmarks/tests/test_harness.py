@@ -4,8 +4,9 @@ import json
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
-from benchmarks.airece_bench.backends import Backend, tool_schema
+from benchmarks.airece_bench.backends import AireceBackend, Backend, tool_schema
 from benchmarks.airece_bench.corpus import (FUNCTIONS, TEST_INPUTS, dense, direct_calls,
                                             indirect, local_array, nested, recursive,
                                             rotate, sparse, structure)
@@ -45,6 +46,7 @@ class PromptTests(unittest.TestCase):
         self.assertNotIn("view", airece["fn"]["parameters"]["properties"])
         detail_views = airece["fn_detail"]["parameters"]["properties"]["view"]["enum"]
         self.assertNotIn("agent", detail_views)
+        self.assertIn("disassembly", detail_views)
         ghidra = {item["name"]: item for item in tool_schema("native", "ghidra")}
         self.assertNotIn("inspect", ghidra)
         self.assertNotIn("list_functions", ghidra)
@@ -89,6 +91,23 @@ class BackendTests(unittest.TestCase):
         self.assertTrue(value["result"].endswith("\n"))
         self.assertGreater(value["omitted"]["records"], 0)
         self.assertEqual(value["continuation"]["kind"], "line")
+
+    def test_airece_common_low_level_combines_pseudo_and_disassembly(self) -> None:
+        responses = [
+            {"exit": 0, "elapsed_ms": 1.0, "stdout": "pseudo line\n", "stderr": ""},
+            {"exit": 0, "elapsed_ms": 2.0, "stdout": "0x1000: 90 nop\n", "stderr": ""},
+        ]
+        backend = AireceBackend(pathlib.Path("airece.exe"),
+                                pathlib.Path("fixture.bin"), 1024, 5.0)
+        with mock.patch("benchmarks.airece_bench.backends.run", side_effect=responses) as run_mock:
+            raw = backend.execute("function_context",
+                {"address": "0x1000", "level": "low_level"}, "common")
+        value = json.loads(raw)
+        self.assertEqual(value["result"], {
+            "pseudo": "pseudo line\n", "disassembly": "0x1000: 90 nop\n"})
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertIn("pseudo", run_mock.call_args_list[0].args[0])
+        self.assertIn("disassembly", run_mock.call_args_list[1].args[0])
 
 
 class ParserScoringTests(unittest.TestCase):

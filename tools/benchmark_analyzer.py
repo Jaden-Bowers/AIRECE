@@ -15,7 +15,7 @@ from typing import Any
 
 
 SCHEMA = "airece.analyzer-benchmark.v1"
-FREEZE_ID = "v0.11.0-benchmark-rc1"
+FREEZE_ID = "v0.11.0-benchmark-rc2"
 CORRECTNESS_TESTS = (
     r"^(airece_(decoder_boundary|expression_view|variable_view|control_view|"
     r"api_model|directed_flow|protocol_cli|source_semantics|evaluation_smoke))$"
