@@ -7,3 +7,5 @@
 *.VC.db
 __pycache__/
 *.py[cod]
+/kb
+.env

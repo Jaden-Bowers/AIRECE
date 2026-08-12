@@ -1,6 +1,6 @@
 # AIRECE AI-utility benchmark harness
 
-This harness measures a frozen local model against the frozen AIRECE analyzer
+This harness measures a configured model against the frozen AIRECE analyzer
 and Ghidra 12.1.2 headless. It implements three distinct tiers: a blinded
 single-context representation test, a blinded common-agentic tool test, and a
 matched native-agentic test. It includes objective JSON scoring, source
@@ -73,6 +73,22 @@ python benchmarks/launch_detached.py --max-cases 20 --repetitions 3
 The launcher records the child PID and exact command in
 `out/ai-utility-benchmark/detached-run.json`; stdout and stderr are retained next
 to it. Development records are excluded from held-out summaries and reports.
+
+For the OpenRouter Grok 4.6 comparison, put `open_router_key` in the repository
+`.env` file and use the separate provider configuration:
+
+```powershell
+python benchmarks/validate_protocol.py `
+  --config benchmarks/config.openrouter.grok-4.6.json --cases 3 `
+  --output out/protocol-validation-grok-4.6.json
+python benchmarks/launch_detached.py `
+  --config benchmarks/config.openrouter.grok-4.6.json `
+  --output-root out/ai-utility-benchmark-grok-4.6 `
+  --split heldout --balanced-categories --max-cases 20 --repetitions 1
+```
+
+The key is read at runtime, removed from retained envelopes, and never written
+to a manifest or run record.
 
 All stage timeouts can be overridden with `--task-timeout-seconds`,
 `--analyzer-timeout-seconds`, `--ghidra-timeout-seconds`,

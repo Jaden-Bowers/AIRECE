@@ -1,0 +1,49 @@
+{
+  "schema": "airece.benchmark-config.v1",
+  "model": {
+    "provider": "openrouter",
+    "id": "x-ai/grok-4.6",
+    "base_urls": ["https://openrouter.ai/api"],
+    "responses_path": "/v1/responses",
+    "temperature": 0,
+    "seed": 424242,
+    "minimum_context_length": 16384,
+    "max_output_tokens": 1024,
+    "reasoning_control": "low",
+    "reasoning": {"effort": "low"},
+    "api_key_env": "open_router_key",
+    "env_file": ".env",
+    "app_name": "AIRECE Benchmark",
+    "tool_transport": "json-protocol",
+    "max_protocol_request_bytes": 24000,
+    "max_final_evidence_bytes": 8000,
+    "max_final_draft_bytes": 4000,
+    "separate_final_generation": true,
+    "schema_constrained_final": false
+  },
+  "budgets": {
+    "max_tool_calls": 3,
+    "max_tool_result_bytes": 4000,
+    "max_input_bytes": 120000,
+    "task_timeout_seconds": 180,
+    "analyzer_timeout_seconds": 30,
+    "ghidra_timeout_seconds": 90,
+    "compile_timeout_seconds": 30,
+    "execute_timeout_seconds": 3
+  },
+  "paths": {
+    "airece": "out/build/windows-msvc/Release/airece.exe",
+    "analyzer_report": "out/benchmark-analyzer-agent.json",
+    "ghidra_root": "C:/Users/Jaden/Desktop/Projects/IR/kb/ghidra_12.1.2_PUBLIC",
+    "instruction_packs": "docs/benchmark-tool-instructions.md",
+    "output_root": "out/ai-utility-benchmark-grok-4.6"
+  },
+  "corpus": {
+    "compilers": ["msvc", "clangcl"],
+    "optimizations": ["O0", "O2"],
+    "crt_variants": ["none", "static", "dynamic"],
+    "seed": 731942
+  },
+  "tracks": ["single", "common", "native"],
+  "conditions": ["airece", "ghidra"]
+}

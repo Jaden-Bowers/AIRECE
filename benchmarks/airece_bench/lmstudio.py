@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import time
 import urllib.error
@@ -97,6 +98,24 @@ class LMStudioAdapter:
         self.base_url: str | None = None
         self.model_metadata: dict[str, Any] | None = None
         self.last_request_attempts = 0
+        self.provider = str(config.get("provider", "lmstudio"))
+        self.api_key: str | None = None
+        key_name = config.get("api_key_env")
+        if isinstance(key_name, str):
+            self.api_key = os.environ.get(key_name)
+            env_path = pathlib.Path(str(config.get("env_file", ".env")))
+            if self.api_key is None and env_path.is_file():
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#") or "=" not in stripped:
+                        continue
+                    name, value = stripped.split("=", 1)
+                    if name.strip() == key_name:
+                        self.api_key = value.strip().strip('"').strip("'")
+                        break
+            if not self.api_key:
+                raise LMStudioError(f"missing API key environment variable: {key_name}")
+            self.redactions.insert(0, self.api_key)
 
     def _redact_text(self, text: str) -> str:
         for item in self.redactions:
@@ -117,8 +136,13 @@ class LMStudioAdapter:
         if self.base_url is None:
             raise LMStudioError("base URL has not been selected")
         data = None if payload is None else canonical_json(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = "Bearer " + self.api_key
+        if self.provider == "openrouter":
+            headers["X-Title"] = str(self.config.get("app_name", "AIRECE Benchmark"))
         request = urllib.request.Request(self.base_url + path, data=data, method=method,
-            headers={"Content-Type": "application/json"})
+                                         headers=headers)
         started = time.perf_counter()
         last_error: Exception | None = None
         request_budget = timeout or self.timeout
@@ -126,7 +150,7 @@ class LMStudioAdapter:
             self.last_request_attempts = attempt
             remaining_budget = request_budget - (time.perf_counter() - started)
             if remaining_budget <= 0:
-                raise LMStudioError("LM Studio request timed out")
+                raise LMStudioError(f"{self.provider} request timed out")
             try:
                 with urllib.request.urlopen(request, timeout=remaining_budget) as response:
                     raw = response.read().decode("utf-8", "replace")
@@ -134,15 +158,24 @@ class LMStudioAdapter:
                         round((time.perf_counter() - started) * 1000, 3)
             except urllib.error.HTTPError as error:
                 body = error.read().decode("utf-8", "replace")
-                if error.code not in {502, 503, 504} or attempt == 2:
-                    raise LMStudioError(f"LM Studio HTTP {error.code}: {body[:4000]}") from error
+                if error.code not in {429, 502, 503, 504} or attempt == 2:
+                    raise LMStudioError(f"{self.provider} HTTP {error.code}: {body[:4000]}") from error
                 last_error = error
+                retry_after = error.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        delay = min(float(retry_after), max(0.0, remaining_budget), 30.0)
+                        if delay > 0:
+                            time.sleep(delay)
+                            continue
+                    except ValueError:
+                        pass
             except (OSError, ValueError) as error:
                 if attempt == 2:
-                    raise LMStudioError(f"LM Studio request failed: {error}") from error
+                    raise LMStudioError(f"{self.provider} request failed: {error}") from error
                 last_error = error
             time.sleep(0.25)
-        raise LMStudioError(f"LM Studio request failed: {last_error}")
+        raise LMStudioError(f"{self.provider} request failed: {last_error}")
 
     def probe(self) -> dict[str, Any]:
         errors: list[str] = []
@@ -150,11 +183,30 @@ class LMStudioAdapter:
         for candidate in self.config["base_urls"]:
             self.base_url = candidate.rstrip("/")
             try:
-                models, _, _ = self._request("GET", "/v1/models", timeout=5)
+                models, model_headers, model_elapsed = self._request(
+                    "GET", "/v1/models", timeout=5)
                 identifiers = [item.get("id") for item in models.get("data", [])]
                 if required not in identifiers:
                     errors.append(f"{candidate}: required model absent")
                     continue
+                if self.provider == "openrouter":
+                    match = next(item for item in models.get("data", [])
+                                 if item.get("id") == required)
+                    supported = set(match.get("supported_parameters", []))
+                    if "tools" not in supported:
+                        errors.append(f"{candidate}: required model does not support tools")
+                        continue
+                    minimum_context = int(self.config.get("minimum_context_length", 0))
+                    if int(match.get("context_length") or 0) < minimum_context:
+                        errors.append(f"{candidate}: model context is below {minimum_context}")
+                        continue
+                    self.model_metadata = {
+                        "provider": self.provider, "selected_base_url": self.base_url,
+                        "required_model": required, "model": self._sanitize(match),
+                        "response_headers": self._sanitize(model_headers),
+                        "probe_elapsed_ms": model_elapsed,
+                        "transport_attempts": self.last_request_attempts}
+                    return self.model_metadata
                 native, headers, elapsed = self._request("GET", "/api/v1/models", timeout=5)
                 match = next((item for item in native.get("models", [])
                               if item.get("key") == required), None)
@@ -176,10 +228,20 @@ class LMStudioAdapter:
             except LMStudioError as error:
                 errors.append(f"{candidate}: {error}")
         self.base_url = None
-        raise LMStudioError("no configured LM Studio endpoint has the required model: " +
+        raise LMStudioError(f"no configured {self.provider} endpoint has the required model: " +
                             "; ".join(errors))
 
     def native_chat_smoke(self) -> dict[str, Any]:
+        if self.provider == "openrouter":
+            payload = {"model": self.config["id"], "input": "Reply with OK only.",
+                       "temperature": 0, "seed": self.config["seed"],
+                       "max_output_tokens": 64, "store": False}
+            if self.config.get("reasoning") is not None:
+                payload["reasoning"] = self.config["reasoning"]
+            response, headers, elapsed = self._request(
+                "POST", self.config["responses_path"], payload)
+            return {"request": self._sanitize(payload), "response": self._sanitize(response),
+                    "headers": self._sanitize(headers), "elapsed_ms": elapsed}
         payload = {"model": self.config["id"], "system_prompt": "Reply with OK only.",
                    "input": "Connectivity check", "temperature": 0,
                    "max_output_tokens": 64}

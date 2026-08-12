@@ -297,6 +297,25 @@ class ResumeTests(unittest.TestCase):
 
 
 class ToolBudgetTests(unittest.TestCase):
+    def test_openrouter_probe_uses_env_file_without_exposing_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = pathlib.Path(directory) / ".env"
+            env_path.write_text("open_router_key=secret-test-key\n", encoding="utf-8")
+            adapter = LMStudioAdapter({"provider": "openrouter", "id": "x-ai/test",
+                "base_urls": ["https://unused/api"], "responses_path": "/v1/responses",
+                "temperature": 0, "seed": 1, "max_output_tokens": 32,
+                "api_key_env": "open_router_key", "env_file": str(env_path),
+                "minimum_context_length": 16384}, 10)
+            adapter._request = lambda *args, **kwargs: ({"data": [{
+                "id": "x-ai/test", "context_length": 500000,
+                "supported_parameters": ["tools", "structured_outputs"]}]},
+                {"authorization": "must-not-survive"}, 1.0)  # type: ignore[method-assign]
+            metadata = adapter.probe()
+            self.assertEqual(metadata["provider"], "openrouter")
+            self.assertEqual(metadata["required_model"], "x-ai/test")
+            self.assertNotIn("authorization", metadata["response_headers"])
+            self.assertEqual(adapter._sanitize("secret-test-key"), "<REDACTED_PATH>")
+
     def test_compact_final_evidence_deduplicates_and_prefers_baseline(self) -> None:
         baseline = '{"result":"agent"}'
         events = [

@@ -430,7 +430,9 @@ class BenchmarkRunner:
                               f"{snapshot['revision']}..{current_revision}")
                 changed_paths = [item for item in (changed or "").splitlines() if item]
                 allowed = all(item.startswith("benchmarks/") or
-                              item == "docs/benchmark-tool-instructions.md"
+                              item.startswith(".github/") or
+                              item in {".gitignore", "README.md",
+                                       "docs/benchmark-tool-instructions.md"}
                               for item in changed_paths)
                 if not changed_paths or not allowed:
                     raise RuntimeError("AIRECE source changed after analyzer freeze: " +
@@ -455,8 +457,9 @@ class BenchmarkRunner:
                               *(str(pathlib.Path(item["binary"]).parent) for item in cases),
                               *(pathlib.Path(item["binary"]).name for item in cases)])
         model_metadata = lm.probe()
-        native_smoke = lm.native_chat_smoke()
-        version = run(["lms", "--version"], self.root, 10)
+        connectivity_smoke = lm.native_chat_smoke()
+        provider = self.config["model"].get("provider", "lmstudio")
+        version = run(["lms", "--version"], self.root, 10) if provider == "lmstudio" else None
         harness_commit = git(self.root, "rev-parse", "HEAD")
         analyzer_commit = health["repositories"]["airece"]["revision"]
         manifest = {"schema": "airece.ai-utility-manifest.v1", "status": "running",
@@ -473,13 +476,16 @@ class BenchmarkRunner:
                          "health_report_sha256": sha256_file(self.analyzer_report_path),
                          "components": health["repositories"]},
             "ghidra": ghidra.version_snapshot(),
-            "model": {"id": self.config["model"]["id"], "metadata": model_metadata,
+            "model": {"id": self.config["model"]["id"], "provider": provider,
+                      "metadata": model_metadata,
                       "model_file_sha256": None,
-                      "model_file_hash_status": "not exposed by LM Studio API",
-                      "lm_studio_version": version["stdout"].strip() or version["stderr"].strip(),
+                      "model_file_hash_status": f"not exposed by {provider} API",
+                      "lm_studio_version": ((version["stdout"].strip() or
+                                             version["stderr"].strip()) if version else None),
                       "chat_prompt_template": None,
-                      "chat_prompt_template_status": "not exposed by LM Studio API",
-                      "generation": self.config["model"], "native_chat_smoke": native_smoke},
+                      "chat_prompt_template_status": f"not exposed by {provider} API",
+                      "generation": self.config["model"],
+                      "connectivity_smoke": connectivity_smoke},
             "instruction_packs": {name: prompt_snapshot(text)
                                   for name, text in self.sections.items()},
             "corpus": {"manifest": str(self.output / "corpus" / "manifest.json"),

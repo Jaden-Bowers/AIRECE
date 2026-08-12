@@ -21,10 +21,12 @@ def main() -> int:
     parser.add_argument("--no-rebuild-corpus", action="store_true")
     parser.add_argument("--balanced-categories", action="store_true")
     parser.add_argument("--output-root")
+    parser.add_argument("--config", default="benchmarks/config.json")
     arguments = parser.parse_args()
 
     root = ROOT
-    config = json.loads((root / "benchmarks" / "config.json").read_text(encoding="utf-8"))
+    config_path = (root / arguments.config).resolve()
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     output = (root / (arguments.output_root or config["paths"]["output_root"])).resolve()
     output.mkdir(parents=True, exist_ok=True)
     stdout_path = output / "detached-run.stdout.log"
@@ -33,6 +35,7 @@ def main() -> int:
     command = [sys.executable, "-u", "-m", "benchmarks.airece_bench.cli",
                "--split", arguments.split, "--max-cases", str(arguments.max_cases),
                "--repetitions", str(arguments.repetitions),
+               "--config", str(config_path),
                "--output-root", str(output)]
     if arguments.balanced_categories:
         command.append("--balanced-categories")

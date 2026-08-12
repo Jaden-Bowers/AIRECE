@@ -1,52 +1,16 @@
 # AIRECE
 
-AIRECE is an AI-first reverse-engineering context engine. XAIR is its only
-semantic IR; AIRECE will build compact, evidence-backed semantic views over
-XAIR rather than reconstructing compilable source or introducing another IR.
+AIRECE is a command-line reverse-engineering context engine for PE/x86-64 binaries. It
+turns XAIR analysis into bounded function summaries, pseudocode, call information,
+references, slices, paths, taint results, and directed flow answers that are practical for
+both people and coding agents.
 
-The current release is experimental and intended for controlled dogfooding and
-corpus evaluation. It is not yet a malware-analysis correctness claim.
-
-This repository is the native C++20 composition layer. Phase 0 establishes the
-single CLI product and pinned component boundary. Phase 1 makes upstream Zydis
-the sole production decoder and caches XAIR-owned decoded records per session.
-Phase 2 adds a bounded `AnalysisSession` that owns the binary, CFG, XAIR module,
-function/call indexes, decode cache, and lazily created symbolic context. Phase
-3 adds cached, bounded expression views over the XAIR def/use graph without
-creating a second semantic IR or invoking Z3. Phase 4 adds deterministic
-presentation variables for arguments, returns, stack/global storage, call
-results, repeated SSA values, and memory-backed buffers. Every inferred name
-and type retains XAIR evidence and confidence. Storage locations, addresses,
-and accessed data are separate identities, so a load/store cannot reuse an
-address as its source-level data value. Phase 5 adds the primary
-budgeted compact function view with stable statement/evidence IDs, calls,
-control, memory, references, unresolved behavior, semantic coverage, and
-continuation hints. Phase 6 adds conservative display-only control regions
-over `xair_cfg` analyses. Pseudocode emits a structured `if` only when both
-arms and their join can be certified. Two-node natural loops are structured
-only when their entry, back edge, and exit are unambiguous. Switches are
-structured only when XAIR CFG supplies a complete bounded index-to-target map;
-otherwise loops, switches, irreducible regions, and limited graphs retain
-function-qualified labels and gotos. Switch destination addresses are never
-presented as case constants.
-Phase 7 adds a compiled-in, versioned Windows API signature set over
-`xair_sym_model_identity` and model kinds. It annotates arguments, returns,
-constants, effects, taint roles, no-return behavior, and handle relationships;
-unknown APIs remain ordinary XAIR calls. Phase 8 adds explicitly requested,
-budgeted symbolic questions and xair_sym provenance taint. Solver timeout and
-unknown are data, and base semantic output survives enrichment failure. Phase
-9 completes the bounded command protocol and the versioned
-`airece.semantic.v1` JSON representation. Version 0.10 adds directed
-point-to-point flow queries. Sources and targets resolve to XAIR SSA/CFG
-anchors; plain taint stays solver-free; optional taint-guided and pure symbolic
-modes return a feasible path condition and witness. Propagation crosses direct
-call arguments and returns with a user-set function depth (default 3; depth 0
-is strictly local). Buffer sources retain byte-offset provenance and relevant
-loads expand into independent byte symbols only for symbolic verification.
+AIRECE does static analysis only. The input binary is never executed.
 
 ## Build
 
-The default dependency layout is:
+The Windows build uses Visual Studio 2022, CMake, and C++20. The three XAIR repositories
+should be checked out beside AIRECE:
 
 ```text
 Projects/
@@ -57,90 +21,159 @@ Projects/
     xair_sym/
 ```
 
-Vendored `xair`, `xair_cfg`, and `xair_sym` directories take precedence when
-present. Exact expected commits live in `cmake/DependencyPins.cmake`. A normal
-configuration rejects dirty dependencies; local dependency development must
-opt in explicitly with `-DAIRECE_ALLOW_DIRTY_DEPENDENCIES=ON`.
+Expected dependency revisions are listed in `cmake/DependencyPins.cmake`. A matching
+vendored XAIR directory is also accepted and takes precedence over a sibling checkout.
+
+Build and test a Release executable from a Visual Studio developer shell:
 
 ```powershell
 cmake --preset windows-msvc
 cmake --build --preset windows-msvc-release
 ctest --preset windows-msvc-release
-out/build/windows-msvc/Release/airece.exe --version
-out/build/windows-msvc/Release/airece.exe inspect sample.exe --profile fast
-out/build/windows-msvc/Release/airece.exe functions sample.exe --max-blocks 50000
-out/build/windows-msvc/Release/airece.exe expr sample.exe 42 --max-expression-depth 8
-out/build/windows-msvc/Release/airece.exe vars sample.exe 0x140001000 --max-variables 256
-out/build/windows-msvc/Release/airece.exe fn sample.exe 0x140001000 --view compact
-out/build/windows-msvc/Release/airece.exe fn sample.exe 0x140001000 --view pseudo --max-bytes 8192
-out/build/windows-msvc/Release/airece.exe fn sample.exe 0x140001000 --view json
-out/build/windows-msvc/Release/airece.exe fn sample.exe 0x140001000 --view compact --symbolic --max-queries 16 --max-states 256 --symbolic-timeout-ms 1000
-out/build/windows-msvc/Release/airece.exe calls sample.exe 0x140001000
-out/build/windows-msvc/Release/airece.exe xrefs sample.exe 0x140002000
-out/build/windows-msvc/Release/airece.exe slice sample.exe F140001000:S:O16
-out/build/windows-msvc/Release/airece.exe taint sample.exe 0x140001000 --max-states 256
-out/build/windows-msvc/Release/airece.exe flow sample.exe --source "input=buffer(rcx,64)@0x140001020:before" --target "sink=callarg(1)@0x140002040" --mode taint --function-depth 3
-out/build/windows-msvc/Release/airece.exe flow sample.exe --source "key=register(rdx)@0x140001020:before" --target "goal=reach@0x140003000" --mode taint-symbolic --function-depth 2 --json
-out/build/windows-msvc/Release/airece.exe path sample.exe --from 0x140001000 --to 0x140001080
-out/build/windows-msvc/Release/airece.exe evidence sample.exe F140001000:S:O16
-python tools/evaluate.py --airece out/build/windows-msvc/Release/airece.exe --manifest C:/path/to/corpus-manifest.json --max-samples 20 --functions-per-binary 5 --output out/evaluation.json
 ```
 
-## Quick analyzer benchmark
+The executable is written to:
 
-The frozen first benchmark target is documented in `BENCHMARK_FREEZE.md` and
-identified by `v0.10.0-benchmark-rc1`. `tools/benchmark_analyzer.py` wraps the
-semantic evaluator with release-artifact metadata, repository-cleanliness and
-revision checks, a fast correctness-focused CTest subset, explicit coverage
-gates, and one machine-readable report. It is intentionally bounded; it is a
-release-candidate health measurement, not a long-running model benchmark.
+```text
+out/build/windows-msvc/Release/airece.exe
+```
+
+Useful CMake options:
+
+| Option | Meaning |
+|---|---|
+| `AIRECE_ENFORCE_DEPENDENCY_PINS` | Require the exact XAIR and Z3 revisions listed in `cmake/DependencyPins.cmake`. Enabled by the preset. |
+| `AIRECE_ALLOW_DIRTY_DEPENDENCIES` | Allow local changes in dependency repositories. Disabled by default. |
+| `AIRECE_STATIC_MSVC_RUNTIME` | Link the static MSVC runtime. Enabled by the preset. |
+| `AIRECE_XAIR_SOURCE_DIR` | Override the XAIR source directory. |
+| `AIRECE_XAIR_CFG_SOURCE_DIR` | Override the xair_cfg source directory. |
+| `AIRECE_XAIR_SYM_SOURCE_DIR` | Override the xair_sym source directory. |
+| `AIRECE_ZYDIS_SOURCE_DIR` | Override the Zydis source directory. |
+| `AIRECE_Z3_SOURCE_DIR` | Override the Z3 source directory. |
+| `BUILD_TESTING` | Build the test suite. Enabled by the preset. |
+
+Example override:
 
 ```powershell
-python tools/benchmark_analyzer.py `
-  --airece out/build/windows-msvc/Release/airece.exe `
-  --build-dir out/build/windows-msvc `
-  --manifest C:/path/to/corpus-manifest.json `
-  --assemblage C:/path/to/Assemblage_PE/binaries.tar.xz `
-  --compiler-samples 10 --assemblage-samples 10 --functions-per-binary 5 `
-  --output out/benchmark-analyzer-quick.json
+cmake --preset windows-msvc -DAIRECE_ALLOW_DIRTY_DEPENDENCIES=ON
 ```
 
-The default gates require all sampled binaries to pass the semantic invariants,
-at least 95% frequency-weighted exact instruction coverage, at least 90% exact
-block coverage, a Release artifact, exact component revisions, and clean source
-trees. Larger AI/Ghidra comparisons should consume the frozen executable and
-record its SHA-256 from this report.
+## Command line
 
-The complete handoff prompt for building the paired local-model/Ghidra harness
-is in `docs/benchmark-agent-prompt.md`. It keeps the analyzer tag immutable,
-uses behavioral and structured fact oracles instead of an LLM judge, isolates
-question-answering from source reconstruction, and requires paired token and
-accuracy measurements.
+```text
+airece <command> <binary> [arguments] [options]
+```
 
-Matched AIRECE and Ghidra usage instructions are in
-`docs/benchmark-tool-instructions.md`. The benchmark uses both a blinded
-common-capability track and a native-agent track so Ghidra's likely pretraining
-advantage is measured separately from the quality of each tool's context.
-The frozen model target is LM Studio model `prism-ml/bonsai-27b`, available at
-`http://172.18.208.1:1234` or host-local `http://localhost:1234`; the harness
-uses `/v1/responses` for function-tool runs.
+Addresses and numeric limits accept normal integer notation, including hexadecimal values
+such as `0x140001000`.
 
-The AIRECE build disables XAIR's bootstrap decoder and CFG's `fast-x86` and
-`zydis-mini` compatibility decoders. It exposes no decoder-selection CLI flag.
+### Commands
 
-All data commands return exit code `3` when a
-resource or rendering limit, an unresolved edge, or incomplete discovery leaves
-a useful partial result. They return `1` only when the requested result cannot
-be produced. `expr` also returns `3` when its rendering budget degrades part of
-a deep graph to named XAIR temporaries. Ordinary import, function navigation,
-expression/variable recovery, control structuring, and compact/pseudo rendering
-never create a symbolic context or initialize Z3.
+| Command | Arguments | What it does |
+|---|---|---|
+| `inspect` | `<binary>` | Reports the binary format, architecture, entry point, sections, imports, exports, and analysis coverage. |
+| `functions` | `<binary>` | Lists discovered functions and their bounds. |
+| `expr` | `<binary> <value-id>` | Renders the recovered expression for one XAIR value. |
+| `vars` | `<binary> <function-address>` | Shows recovered parameters, locals, buffers, and repeated values for a function. |
+| `fn` | `<binary> <function-address>` | Produces an agent, compact, pseudo, IR, or JSON function view. |
+| `calls` | `<binary> [function-address]` | Lists call sites for the program or for one function. |
+| `xrefs` | `<binary> <address>` | Finds code and data references to an address. |
+| `slice` | `<binary> <address-or-statement>` | Traces the bounded backward data dependencies of an instruction or stable statement ID. |
+| `taint` | `<binary> <function-address>` | Runs bounded provenance taint analysis for a function. |
+| `flow` | `<binary> --source <selector> --target <selector>` | Answers a directed source-to-target taint or symbolic-flow question. |
+| `path` | `<binary> --from <address> --to <address>` | Finds a bounded control-flow path between two addresses. |
+| `evidence` | `<binary> <statement-id>` | Resolves a stable statement or evidence ID back to its instructions and XAIR operations. |
+| `--version` | none | Prints the AIRECE, schema, model-set, and dependency versions. |
+| `--help` | none | Prints the command reference. |
 
-## Directed flow selectors
+### Analysis options
 
-`flow` accepts repeated `--source` and `--target` options. A selector may be
-named with `name=selector`; names become stable symbolic byte names and appear
-in agent-readable output. Indexes are zero-based.
+These options apply to commands that build or query an analysis session.
+
+| Flag | Meaning |
+|---|---|
+| `--profile <fast\|balanced\|exhaustive>` | Selects the CFG discovery profile. `fast` does the least discovery, `balanced` includes normal metadata roots such as exports, and `exhaustive` spends more work on discovery. |
+| `--max-input-bytes <count>` | Maximum number of bytes accepted from the input binary. |
+| `--max-functions <count>` | Maximum number of functions to discover. |
+| `--max-blocks <count>` | Maximum total CFG blocks. |
+| `--max-edges <count>` | Maximum total CFG edges. |
+| `--max-ir-values <count>` | Maximum number of lifted XAIR values. |
+| `--max-memory-bytes <count>` | Maximum amount of analysis-owned memory. |
+| `--max-wall-time-ms <count>` | Analysis wall-clock limit in milliseconds. |
+| `--no-ir` | Builds navigation data without lifting XAIR IR. Commands that require IR reject this option. |
+| `--no-indirects` | Skips indirect branch and call resolution. |
+
+### Expression options
+
+These apply to `expr` and to views that render expressions.
+
+| Flag | Meaning |
+|---|---|
+| `--max-expression-depth <count>` | Maximum recursive expression depth. |
+| `--max-expression-nodes <count>` | Maximum expression graph nodes. |
+| `--max-expression-tokens <count>` | Maximum rendered expression tokens. |
+| `--max-expression-characters <count>` | Maximum rendered expression characters. |
+| `--no-inline-loads` | Keeps memory loads explicit instead of substituting their recovered values. |
+| `--no-inline-single-use` | Keeps single-use temporary values explicit. |
+
+### Variable options
+
+These apply to `vars`.
+
+| Flag | Meaning |
+|---|---|
+| `--max-variables <count>` | Maximum variables returned. |
+| `--repeated-use-threshold <count>` | Minimum use count for presenting a repeated SSA value as a named variable. |
+| `--no-repeated-values` | Omits named repeated SSA values. |
+| `--no-buffers` | Disables buffer-shaped variable recovery. |
+
+### Function-view options
+
+These apply to `fn`.
+
+| Flag | Meaning |
+|---|---|
+| `--view <agent\|compact\|pseudo\|ir\|json>` | Selects the output. `agent` is a small semantic digest, `compact` is bounded semantic text, `pseudo` adds conservative structured control flow, `ir` exposes lifted operations, and `json` emits `airece.semantic.v1`. |
+| `--json` | Alias for `--view json`. |
+| `--max-bytes <count>` | Maximum output bytes. |
+| `--max-statements <count>` | Maximum statements returned. |
+| `--max-calls <count>` | Maximum call records returned. |
+| `--max-evidence <count>` | Maximum evidence records returned. |
+| `--max-expression-depth <count>` | Maximum expression depth inside the function view. |
+| `--offset <call-index>` | Starts the bounded call page at a call index. |
+| `--calls` | Includes the bounded call page in compact output. |
+
+### Symbolic and taint options
+
+Symbolic work is opt-in. Normal compact and agent views do not initialize a solver.
+
+| Flag | Meaning |
+|---|---|
+| `--symbolic` | Enables bounded symbolic enrichment. |
+| `--taint` | Enables provenance taint enrichment. |
+| `--max-queries <count>` | Maximum solver queries. |
+| `--max-states <count>` | Maximum explored symbolic states. |
+| `--symbolic-timeout-ms <count>` | Per-query symbolic timeout in milliseconds. |
+
+### Directed-flow options
+
+`flow` accepts repeated sources and targets. Argument indexes are zero-based.
+
+| Flag | Meaning |
+|---|---|
+| `--source <selector>` | Adds a source point. Repeat for multiple sources. |
+| `--target <selector>` | Adds a target point. Repeat for multiple targets. |
+| `--mode <taint\|taint-symbolic\|symbolic>` | Chooses solver-free dependency flow, taint-guided symbolic checking, or symbolic reachability. |
+| `--function-depth <count>` | Maximum call depth for interprocedural propagation. The default is `3`; `0` stays inside one function. |
+| `--max-states <count>` | Maximum states explored. |
+| `--max-queries <count>` | Maximum solver queries. |
+| `--max-paths <count>` | Maximum candidate paths. |
+| `--max-taint-bytes <count>` | Maximum tracked buffer extent. |
+| `--max-symbolic-bytes <count>` | Maximum number of relevant bytes expanded into symbolic byte values. |
+| `--symbolic-timeout-ms <count>` | Per-query symbolic timeout in milliseconds. |
+| `--json` | Emits `airece.flow.v1` JSON. |
+
+Flow selectors:
 
 ```text
 register(rcx)@0x140001020:before
@@ -154,25 +187,84 @@ reach@0x140003000
 memory-write@0x140003020
 ```
 
-`--mode taint` answers whether an explicit data/control dependency may flow
-from A to B and never initializes the solver. `--mode taint-symbolic` first
-requires that structural dependency, then checks a bounded CFG path and emits
-the path conditions and a satisfying input witness. `--mode symbolic` asks
-only whether B is reachable when A is symbolic. A feasible witness proves one
-path; its constraints are not claimed to be necessary for every path.
+A selector may have a stable name, for example
+`input=buffer(rdx,256)@0x140001025:before`.
 
-Calls consume one `--function-depth` level when propagation enters their
-callee. The default is 3, and 0 disables cross-function propagation.
-Indirect/unresolved calls remain conservative and can cause an `unknown`
-completion. `--max-taint-bytes` bounds tracked buffer extent, while
-`--max-symbolic-bytes` bounds expansion of relevant offsets into per-byte
-symbols. Direct calls use a bounded, matched call/return context; indirect calls
-and memory aliases remain conservative. Flow JSON uses schema
-`airece.flow.v1`.
+`path` also requires `--from <address>` and `--to <address>` for the path endpoints.
 
-CLI stdout contains requested data only; diagnostics go to stderr. Exit codes
-are stable: `0` complete, `1` analysis failure, `2` usage error, and `3` useful
-partial output. JSON diagnostics never appear inside the JSON document. Model
-set version `2.0.0` and all component revisions are reported by `--version`.
-Every successful JSON request emits valid JSON within its byte budget. Budgets
-of two bytes may degrade to `{}`; a smaller budget fails explicitly on stderr.
+### Examples
+
+```powershell
+airece inspect sample.exe --profile balanced
+airece fn sample.exe 0x140001000 --view agent
+airece fn sample.exe 0x140001000 --view pseudo --max-bytes 8192
+airece calls sample.exe 0x140001000
+airece slice sample.exe F140001000:S:O16
+airece evidence sample.exe F140001000:S:O16
+airece flow sample.exe `
+  --source "input=buffer(rcx,64)@0x140001020:before" `
+  --target "sink=callarg(1)@0x140002040" `
+  --mode taint --function-depth 3 --json
+```
+
+Exit codes are stable:
+
+| Code | Meaning |
+|---:|---|
+| `0` | Complete result. |
+| `1` | Analysis failed or the requested result could not be produced. |
+| `2` | Invalid command or option. |
+| `3` | Useful partial result. Check the output's coverage, omitted, and unresolved fields. |
+
+## Benchmark
+
+The benchmark compares the same model solving the same held-out reverse-engineering tasks
+with AIRECE and Ghidra 12.1.2 headless. It has three tiers:
+
+1. **Single context:** one AIRECE agent view or one Ghidra decompilation.
+2. **Common agentic:** the same blinded navigation tool schema backed by either analyzer.
+3. **Native agentic:** each analyzer exposes its own useful operations and matching guide.
+
+Each tier contains strict objective questions and source reconstruction tasks. Objective
+answers are scored against structured facts and evidence locations. Reconstructions are
+compiled and run against hidden tests generated from known-benign fixtures. Analyzer output,
+model requests, token use, tool calls, failures, and paired bootstrap intervals are retained
+in the run artifacts.
+
+The current Bonsai 27B run used nine balanced held-out cases, one repetition, and 102 model
+sessions. AIRECE passed more behavioral reconstruction tests in every tier:
+
+| Tier | AIRECE | Ghidra | AIRECE minus Ghidra |
+|---|---:|---:|---:|
+| Single context | 330/512 | 267/512 | +12.3 percentage points |
+| Common agentic | 323/512 | 128/512 | +38.1 percentage points |
+| Native agentic | 210/512 | 17/512 | +37.7 percentage points |
+
+Objective field results were `61/117` versus `51/117` in the single tier, `56/117`
+versus `42/117` in the common tier, and `66/117` versus `61/117` in the native tier.
+There were no timeouts, transport retries, transcript compactions, or failed harness jobs.
+
+Run the local-model configuration:
+
+```powershell
+python -m benchmarks.airece_bench.cli --dry-run --split heldout `
+  --balanced-categories --max-cases 20 --repetitions 1
+python -m benchmarks.airece_bench.cli --split heldout `
+  --balanced-categories --max-cases 20 --repetitions 1
+```
+
+Run the OpenRouter Grok 4.6 configuration after setting `open_router_key` in `.env`:
+
+```powershell
+python -m benchmarks.airece_bench.cli `
+  --config benchmarks/config.openrouter.grok-4.6.json --dry-run `
+  --split heldout --balanced-categories --max-cases 20 --repetitions 1
+python benchmarks/launch_detached.py `
+  --config benchmarks/config.openrouter.grok-4.6.json `
+  --output-root out/ai-utility-benchmark-grok-4.6 `
+  --split heldout --balanced-categories --max-cases 20 --repetitions 1
+```
+
+Benchmark output contains `manifest.json`, `runs.jsonl`, `summary.json`, `report.md`, and
+one atomic JSON record per model session. See `benchmarks/README.md` for the full harness
+command reference.
