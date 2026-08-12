@@ -106,7 +106,8 @@ def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
         "airece_semantic_agent_dense_switch",
         "airece_semantic_loop", "airece_semantic_storage",
         "airece_semantic_transform", "airece_semantic_interproc",
-        "airece_semantic_memory_flow",
+        "airece_semantic_memory_flow", "airece_semantic_agent_indirect",
+        "airece_semantic_agent_recursion",
     }
     missing = expected - exports.keys()
     if missing:
@@ -123,6 +124,8 @@ def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
         "airece_semantic_transform": 1,
         "airece_semantic_interproc": 1,
         "airece_semantic_memory_flow": 2,
+        "airece_semantic_agent_indirect": 2,
+        "airece_semantic_agent_recursion": 1,
     }
     documents: dict[str, dict[str, object]] = {}
     optimized = "opt" in fixture.stem or "o2" in fixture.stem
@@ -231,6 +234,71 @@ def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
                 raise AssertionError(f"agent dense-switch semantics incomplete: {switches}")
             if agent.get("memory_effects") or "trap" in raw_agent.lower():
                 raise AssertionError(f"agent view leaked dispatch machinery: {agent}")
+
+        if name == "airece_semantic_switch" and not optimized:
+            sparse_agent = json.loads(run(
+                airece, "fn", str(fixture), address, "--view", "agent",
+                "--profile", "balanced", "--max-bytes", "4096",
+                "--max-statements", "128", "--max-evidence", "128",
+            ))
+            paths = sparse_agent.get("paths", [])
+            linked = [(" | ".join(item.get("when", [])), item.get("result", ""))
+                      for item in paths]
+            if (len(paths) < 4 or
+                    not any("arg0 == 3" in when and "0x1f" in result
+                            for when, result in linked) or
+                    not any("arg0 == 9" in when and "0x61" in result
+                            for when, result in linked) or
+                    not any("arg0 == 0x11" in when and "0xad" in result
+                            for when, result in linked)):
+                raise AssertionError(
+                    f"agent sparse-switch predicates are not linked to results: {paths}")
+
+        if name == "airece_semantic_agent_indirect" and optimized:
+            indirect_agent = json.loads(run(
+                airece, "fn", str(fixture), address, "--view", "agent",
+                "--profile", "balanced", "--max-bytes", "4096",
+                "--max-statements", "128", "--max-evidence", "128",
+            ))
+            calls = [item for item in indirect_agent.get("behavior", [])
+                     if item.get("kind") == "call" and item.get("call_kind") == "indirect"]
+            if len(calls) != 1:
+                raise AssertionError(f"agent indirect-call behavior missing: {indirect_agent}")
+            call = calls[0]
+            summaries = [result.get("expression", "")
+                         for summary in call.get("callee_summaries", [])
+                         for result in summary.get("returns", [])]
+            returns = [item.get("expression", "")
+                       for item in indirect_agent.get("returns", [])]
+            if (call.get("arguments") != ["arg1"] or len(call.get("targets", [])) != 2 or
+                    not any("arg0 + 0x21" in item for item in summaries) or
+                    not any("arg0 ^ 0x87654321" in item for item in summaries) or
+                    len(returns) != 1 or "arg0 & 0xff" not in returns[0]):
+                raise AssertionError(
+                    f"agent indirect targets/guards/summaries are incomplete: {indirect_agent}")
+
+        if name == "airece_semantic_agent_recursion" and optimized:
+            recursive_agent = json.loads(run(
+                airece, "fn", str(fixture), address, "--view", "agent",
+                "--profile", "balanced", "--max-bytes", "4096",
+                "--max-statements", "128", "--max-evidence", "128",
+            ))
+            recurrences = [summary.get("recurrence", "")
+                           for item in recursive_agent.get("behavior", [])
+                           for summary in item.get("callee_summaries", [])]
+            summary_paths = [path
+                             for item in recursive_agent.get("behavior", [])
+                             for summary in item.get("callee_summaries", [])
+                             for path in summary.get("paths", [])]
+            recurrence = any("self(arg0)" in item and "self(arg0 - 1)" in item
+                             for item in recurrences)
+            optimized_closed_form = (len(summary_paths) >= 2 and
+                                     all(path.get("result") for path in summary_paths) and
+                                     any("arg0" in path.get("result", "")
+                                         for path in summary_paths))
+            if not recurrence and not optimized_closed_form:
+                raise AssertionError(
+                    f"agent recursive helper lacks a recurrence: {recursive_agent}")
 
         if name == "airece_semantic_branch" and not optimized:
             branch_agent = json.loads(run(

@@ -6,11 +6,10 @@ not hidden scoring instructions. Their exact UTF-8 contents and hashes must be
 recorded with every run, and their tokens count toward the condition's input
 budget.
 
-The frozen benchmark model is `prism-ml/bonsai-27b`, served by LM Studio at
-`http://172.18.208.1:1234` with `http://localhost:1234` as the host-local
-fallback. Native-agent tool schemas are passed through LM Studio's
-`/v1/responses` function-tool interface. The prompt text below must be supplied
-as condition instructions; do not assume the model retained it between runs.
+The benchmark model and provider come from the selected config. Native-agent tool schemas
+are passed through the provider's Responses-compatible interface. The prompt text below
+must be supplied as condition instructions; do not assume the model retained it between
+runs.
 
 Run three complementary comparisons:
 
@@ -52,14 +51,16 @@ source code.
 ## AIRECE native-agent instruction pack
 
 ```text
-The active analysis tool is AIRECE v0.10.0 benchmark freeze
-v0.10.0-benchmark-rc1. AIRECE is a bounded, AI-oriented static context engine
+The active analysis tool is AIRECE v0.11.0 benchmark freeze
+v0.11.0-benchmark-rc1. AIRECE is a bounded, AI-oriented static context engine
 for PE/x86-64 binaries. XAIR is its sole semantic IR. AIRECE deliberately emits
 unknown, opaque, partial, or unresolved information instead of guessing.
 
 The controller supplies the target function's bounded agent digest before the
-first tool-selection turn. Read it before requesting anything else. It contains
-parameters, returns, conditions, switches, calls, and memory effects. Use `fn`
+first tool-selection turn. Read it before requesting anything else. Its ordered behavior
+records link predicates to results, indirect targets to guards, call arguments to bounded
+one-hop callee summaries, and recursive helpers to recurrences when present. It also contains
+parameters, returns, switches, calls, state updates, and memory effects. Use `fn`
 to obtain the same agent digest only for a newly followed callee. Use
 `fn_detail` only when the supplied digest lacks one fact required by the task;
 select the narrowest compact, JSON, pseudo, or IR view and a limit no larger
@@ -94,7 +95,8 @@ Important output rules:
 Recommended workflow: read the supplied agent digest; answer immediately when
 it is sufficient; otherwise make one narrow calls, xrefs, evidence, slice, or
 `fn_detail` request; follow a callee with `fn` only when its behavior is needed;
-then answer. Exact duplicate requests end tool selection. Use flow, path, or IR
+then answer. Common-track low-level context is bounded pseudocode rather than raw IR.
+Exact duplicate requests end tool selection. Use flow, path, or IR
 only for a specific unresolved dependency or feasibility question.
 ```
 

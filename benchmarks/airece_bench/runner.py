@@ -222,6 +222,13 @@ def _assert_semantic_context(category: str | None, context: dict[str, Any]) -> b
                 [item.get("result") for item in switches[0].get("cases", [])] != dense_results or
                 switches[0].get("default", {}).get("result") != "arg1 ^ 0x313"):
             raise AssertionError("dense-switch agent semantics are incomplete")
+        behavior_switches = [item for item in context.get("behavior", [])
+                             if item.get("kind") == "switch"]
+        if (len(behavior_switches) != 1 or
+                behavior_switches[0].get("selector") != "arg0 & 7" or
+                [item.get("result") for item in behavior_switches[0].get("cases", [])] !=
+                dense_results):
+            raise AssertionError("dense-switch ordered behavior is incomplete")
     elif category == "bit-manipulation":
         joined = " | ".join(returns)
         if ("arg0" not in joined or "arg1" not in joined or
@@ -231,9 +238,23 @@ def _assert_semantic_context(category: str | None, context: dict[str, Any]) -> b
     elif category == "sparse-switch":
         joined = " | ".join(conditions)
         case_constants = {"0x3", "0x9", "0x11"}
-        if (len(returns) < 4 or not (case_constants.issubset(constants) or
-                all(value in joined for value in ("3", "9", "0x11")))):
+        paths = context.get("paths", [])
+        linked = [(" | ".join(map(str, item.get("when", []))),
+                   str(item.get("result", ""))) for item in paths]
+        required = (("arg0 == 3", "arg1 + 0x1f"),
+                    ("arg0 == 9", "arg1 ^ 0x61"),
+                    ("arg0 == 0x11", "arg1 * 0xad"))
+        if (len(returns) < 4 or len(paths) < 4 or
+                not all(any(predicate in when and result == expression
+                            for when, result in linked)
+                        for predicate, expression in required) or
+                not (case_constants.issubset(constants) or
+                     all(value in joined for value in ("3", "9", "0x11")))):
             raise AssertionError("sparse-switch agent context lacks cases or results")
+        behavior_paths = [item for item in context.get("behavior", [])
+                          if item.get("kind") == "branch-result"]
+        if len(behavior_paths) != len(paths):
+            raise AssertionError("sparse-switch ordered behavior lost predicate-result paths")
     elif category == "loop-and-array":
         if not any("arg0" in item and "arg1" in item and
                    ("* 4" in item or "4 *" in item) for item in returns):
@@ -253,6 +274,12 @@ def _assert_semantic_context(category: str | None, context: dict[str, Any]) -> b
     elif category == "recursion":
         if not any(item.startswith("direct:") for item in calls):
             raise AssertionError("recursion agent context contains no recursive call fact")
+        recurrences = [str(summary.get("recurrence", ""))
+                       for item in context.get("behavior", [])
+                       for summary in item.get("callee_summaries", [])]
+        if not any("self(arg0)" in item and "self(arg0 - 1)" in item and
+                   "when" in item for item in recurrences):
+            raise AssertionError("recursion agent context lacks a bounded recurrence")
     elif category == "api-source-sink-flow":
         if (len([item for item in calls if item.startswith("imported:")]) < 2 or
                 "read:api-mediated" not in effects):
@@ -269,6 +296,12 @@ def _assert_semantic_context(category: str | None, context: dict[str, Any]) -> b
         if (not updates or not updates[0].get("persists_across_calls") or
                 "initial=" not in str(updates[0].get("prior_value", ""))):
             raise AssertionError("global-memory context lacks persistent initial state")
+        behavior_updates = [item for item in context.get("behavior", [])
+                            if item.get("kind") == "state-update"]
+        if (len(behavior_updates) != 1 or
+                behavior_updates[0].get("new_value") != updates[0].get("new_value") or
+                not behavior_updates[0].get("persists_across_calls")):
+            raise AssertionError("global-memory behavior lacks an ordered persistent update")
     elif category == "structure-access":
         if (not any("arg0" in item and "arg1" in item for item in returns) or
                 not {"0x9", "0x1234"}.issubset(constants)):
@@ -276,6 +309,24 @@ def _assert_semantic_context(category: str | None, context: dict[str, Any]) -> b
     elif category == "indirect-call":
         if not any(item.startswith("indirect(") or item == "indirect" for item in calls):
             raise AssertionError("indirect-call agent context lacks an indirect call fact")
+        call_behaviors = [item for item in context.get("behavior", [])
+                          if item.get("kind") == "call" and
+                          item.get("call_kind") == "indirect"]
+        if len(call_behaviors) != 1:
+            raise AssertionError("indirect-call context lacks one linked call behavior")
+        call = call_behaviors[0]
+        targets = call.get("targets", [])
+        summaries = call.get("callee_summaries", [])
+        summary_returns = {str(item.get("target")): {
+            str(result.get("expression")) for result in item.get("returns", [])}
+            for item in summaries}
+        guards = " | ".join(str(item.get("when", "")) for item in targets)
+        if (call.get("arguments") != ["arg1"] or len(targets) != 2 or
+                "arg0" not in guards or "1" not in guards or
+                not any("arg0 + 0x21" in values for values in summary_returns.values()) or
+                not any("arg0 ^ 0x87654321" in values for values in summary_returns.values()) or
+                len(returns) != 1 or "arg0 & 0xff" not in returns[0]):
+            raise AssertionError("indirect-call targets, guards, bindings, or result are incomplete")
     else:
         return False
     return True
@@ -465,9 +516,9 @@ class BenchmarkRunner:
         manifest = {"schema": "airece.ai-utility-manifest.v1", "status": "running",
             "created_unix": int(time.time()), "config": self.config,
             "config_sha256": sha256_file(self.config_path),
-            "analyzer": {"tag": "airece-agent-view-freeze-2026-08-11",
+            "analyzer": {"tag": "v0.11.0-benchmark-rc1",
                          "commit": analyzer_commit,
-                         "freeze_tag": "airece-agent-view-freeze-2026-08-11",
+                         "freeze_tag": "v0.11.0-benchmark-rc1",
                          "harness_commit": harness_commit,
                          "executable": str(self.airece),
                          "sha256": health["artifact"]["sha256"],

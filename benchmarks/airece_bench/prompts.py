@@ -88,7 +88,8 @@ uint32_t target(uint32_t a, uint32_t b)
 Do not include headers, main, prose, markdown fences, assembly, pragmas, imports, or calls
 to operating-system or library APIs. Unsigned 32-bit wraparound is intentional.
 Express recovered behavior using only a, b, uint32_t local variables, constants, ordinary C
-operators, and structured control flow. Do not copy analyzer temporaries, registers, memory
+operators, and structured control flow. A function-local static uint32_t variable is allowed
+only when the evidence establishes state that persists across calls. Do not copy analyzer temporaries, registers, memory
 primitives, addresses-as-variables, or unresolved helper names into the function.
 """
 

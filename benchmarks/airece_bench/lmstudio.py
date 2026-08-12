@@ -561,8 +561,9 @@ requested by the task. Do not emit a tool-protocol wrapper, commentary, or markd
 """
                 if final_schema is None:
                     final_instructions += """
-Reconstruct behavior, not analyzer syntax. Use only the parameters a and b, uint32_t local
-variables, integer constants, ordinary C operators, and structured control flow. Never copy
+Reconstruct behavior, not analyzer syntax. Use the parameters a and b, uint32_t variables,
+integer constants, ordinary C operators, and structured control flow. A function-local static
+uint32_t is permitted only for evidence-backed state that persists across calls. Never copy
 analysis identifiers or primitives such as tmp_v*, buffer_v*, stack_*, load32, store32,
 extract, zext, registers, addresses as variables, or unresolved helper calls. Inline any
 needed helper behavior. Return exactly uint32_t target(uint32_t a, uint32_t b) { ... }.

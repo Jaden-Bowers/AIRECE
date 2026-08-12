@@ -67,6 +67,11 @@ class BackendTests(unittest.TestCase):
         def _execute(self, name, arguments, track):
             return self._bounded({"ok": True, "result": list(range(100))})
 
+    class DummyText(Backend):
+        def _execute(self, name, arguments, track):
+            return self._bounded({"ok": True, "result": "".join(
+                f"record-{index}: {'x' * 40}\n" for index in range(20))})
+
     def test_results_are_valid_bounded_json_and_duplicates_are_cached(self) -> None:
         backend = self.Dummy(pathlib.Path("fixture.bin"), 256)
         first = backend.execute("inspect", {}, "common")
@@ -75,6 +80,15 @@ class BackendTests(unittest.TestCase):
         self.assertGreater(value["omitted"]["records"], 0)
         duplicate = json.loads(backend.execute("inspect", {}, "common"))
         self.assertEqual(duplicate, {"ok": True, "same_result_as_call": 1})
+
+    def test_text_results_truncate_at_record_boundaries_with_continuation(self) -> None:
+        backend = self.DummyText(pathlib.Path("fixture.bin"), 320)
+        raw = backend.execute("inspect", {}, "common")
+        self.assertLessEqual(len(raw.encode("utf-8")), 320)
+        value = json.loads(raw)
+        self.assertTrue(value["result"].endswith("\n"))
+        self.assertGreater(value["omitted"]["records"], 0)
+        self.assertEqual(value["continuation"]["kind"], "line")
 
 
 class ParserScoringTests(unittest.TestCase):
@@ -214,11 +228,22 @@ class CorpusTests(unittest.TestCase):
             "dense-switch": {"switches": [{"selector": "arg0 & 7",
                 "cases": [{"value": index, "result": result}
                           for index, result in enumerate(dense_results)],
-                "default": {"result": "arg1 ^ 0x313"}}]},
+                "default": {"result": "arg1 ^ 0x313"}}],
+                "behavior": [{"kind": "switch", "selector": "arg0 & 7",
+                    "cases": [{"value": index, "result": result}
+                              for index, result in enumerate(dense_results)]}]},
             "bit-manipulation": {"returns": [{"expression": "arg0 ^ arg1"}],
                 "constants": ["0x1f", "0xa5a5a5a5"]},
-            "sparse-switch": {"returns": [{"expression": str(index)} for index in range(4)],
-                "conditions": [{"expression": "arg0 == 3 | arg0 == 9 | arg0 == 0x11"}]},
+            "sparse-switch": {"returns": [
+                    {"expression": "arg1 + 0x1f"}, {"expression": "arg1 ^ 0x61"},
+                    {"expression": "arg1 * 0xad"}, {"expression": "arg1 - 1"}],
+                "conditions": [{"expression": "arg0 == 3 | arg0 == 9 | arg0 == 0x11"}],
+                "paths": [
+                    {"when": ["arg0 == 3"], "result": "arg1 + 0x1f"},
+                    {"when": ["not(arg0 == 3)", "arg0 == 9"], "result": "arg1 ^ 0x61"},
+                    {"when": ["arg0 == 0x11"], "result": "arg1 * 0xad"},
+                    {"when": ["otherwise"], "result": "arg1 - 1"}],
+                "behavior": [{"kind": "branch-result"} for _ in range(4)]},
             "loop-and-array": {"returns": [{"expression": "arg0 + arg1 * 4"}],
                 "constants": ["0x4"]},
             "nested-branches": {"returns": [{"expression": "a"}, {"expression": "b"}],
@@ -228,7 +253,9 @@ class CorpusTests(unittest.TestCase):
             "direct-calls": {"calls": [{"kind_target": "direct:0x1(arg0=arg0)"},
                                           {"kind_target": "direct:0x1(arg0=arg1)"}],
                 "returns": [{"expression": "result(direct:0x1) ^ result(direct:0x1)"}]},
-            "recursion": {"calls": [{"kind_target": "direct:0x1"}]},
+            "recursion": {"calls": [{"kind_target": "direct:0x1"}],
+                "behavior": [{"callee_summaries": [{"recurrence":
+                    "self(arg0) = 1 when arg0 <= 1; arg0 + self(arg0 - 1) otherwise"}]}]},
             "api-source-sink-flow": {"calls": [{"kind_target": "imported:0x1"},
                                                    {"kind_target": "imported:0x2"}],
                 "memory_effects": [{"effect": "read:api-mediated"}]},
@@ -236,10 +263,21 @@ class CorpusTests(unittest.TestCase):
                 {"effect": "write:global", "expression": "arg0 ^ arg1"}],
                 "state_updates": [{"prior_value": "global(initial=0x1)",
                                    "new_value": "arg0 ^ arg1",
-                                   "persists_across_calls": True}]},
+                                   "persists_across_calls": True}],
+                "behavior": [{"kind": "state-update", "new_value": "arg0 ^ arg1",
+                              "persists_across_calls": True}]},
             "structure-access": {"returns": [{"expression": "arg0 + arg1"}],
                 "constants": ["0x9", "0x1234"]},
-            "indirect-call": {"calls": [{"kind_target": "indirect"}]},
+            "indirect-call": {"calls": [{"kind_target": "indirect"}],
+                "returns": [{"expression": "result(indirect(arg0=arg1)) + (arg0 & 0xff)"}],
+                "behavior": [{"kind": "call", "call_kind": "indirect",
+                    "arguments": ["arg1"],
+                    "targets": [{"address": "0x1", "when": "arg0 & 1"},
+                                {"address": "0x2", "when": "not(arg0 & 1)"}],
+                    "callee_summaries": [
+                        {"target": "0x1", "returns": [{"expression": "arg0 + 0x21"}]},
+                        {"target": "0x2", "returns": [
+                            {"expression": "arg0 ^ 0x87654321"}]}]}]},
         }
         self.assertEqual(set(contexts), {item["category"] for item in FUNCTIONS.values()})
         for context in contexts.values():

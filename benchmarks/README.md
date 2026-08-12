@@ -7,6 +7,11 @@ matched native-agentic test. It includes objective JSON scoring, source
 reconstruction with hidden behavioral tests, atomic resumable records, and both
 case-paired and source-program-clustered bootstrap intervals.
 
+In the common track, AIRECE `primary` context is the bounded agent digest and
+`low_level` context is bounded pseudocode. Raw IR remains an explicit native
+`fn_detail` choice. Text results are trimmed only at complete line boundaries
+and include omission and continuation metadata.
+
 Load `prism-ml/bonsai-27b` in LM Studio with the checked-in 16,384-token context
 length before running. The benchmark preflight records the native model metadata.
 

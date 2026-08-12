@@ -88,6 +88,19 @@ class Backend:
         omitted = 0
         rendered = canonical_json(value)
         while len(rendered.encode("utf-8")) > self.max_bytes:
+            # Text views are trimmed only at complete line boundaries. Never delete
+            # the entire result string or return a corrupt partial JSON document.
+            if isinstance(value, dict) and isinstance(value.get("result"), str):
+                lines = value["result"].splitlines(keepends=True)
+                if len(lines) > 1:
+                    lines.pop()
+                    value["result"] = "".join(lines)
+                    omitted += 1
+                    value["omitted"] = {"records": omitted}
+                    value["continuation"] = {
+                        "available": True, "kind": "line", "next_record": len(lines)}
+                    rendered = canonical_json(value)
+                    continue
             lists: list[list[Any]] = []
             fields: list[tuple[dict[str, Any], str]] = []
             def collect(item: Any) -> None:
@@ -109,7 +122,8 @@ class Backend:
                 del owner[key]
             else:
                 return canonical_json({"ok": False, "error": "bounded result unavailable",
-                                       "omitted": {"records": omitted + 1}})
+                    "omitted": {"records": omitted + 1},
+                    "continuation": {"available": False}})
             omitted += 1
             if isinstance(value, dict):
                 value["omitted"] = {"records": omitted}
@@ -148,7 +162,7 @@ class AireceBackend(Backend):
         elif name in {"fn", "fn_detail"}:
             view = (str(arguments["view"]) if requested_name == "fn_detail" else
                     ("agent" if requested_name == "fn" and "level" not in arguments else
-                     ("agent" if arguments.get("level") == "primary" else "ir")))
+                     ("agent" if arguments.get("level") == "primary" else "pseudo")))
             limit = min(max(int(arguments.get("limit", 64)), 16), 64)
             command += ["fn", str(self.binary), str(arguments["address"]), "--view", view,
                         "--profile", "fast", "--max-bytes", str(self.max_bytes),

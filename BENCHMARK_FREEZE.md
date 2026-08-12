@@ -1,9 +1,10 @@
 # AIRECE benchmark freeze
 
-Freeze identifier: `v0.10.0-benchmark-rc1`
+Freeze identifier: `v0.11.0-benchmark-rc1`
 
-This release candidate is the immutable AIRECE target for the first public
-analyzer and AI-utility benchmarks. The annotated Git tag with the freeze
+This release candidate is the immutable AIRECE target for the next analyzer and
+AI-utility benchmark. The earlier v0.10.0 tag remains the diagnostic baseline.
+The annotated Git tag with the current freeze
 identifier is authoritative for the AIRECE source revision. Benchmark reports
 must record the tag, AIRECE commit, executable SHA-256, and the component
 revisions printed by `airece --version`.

@@ -133,7 +133,7 @@ These apply to `fn`.
 
 | Flag | Meaning |
 |---|---|
-| `--view <agent\|compact\|pseudo\|ir\|json>` | Selects the output. `agent` is a small semantic digest, `compact` is bounded semantic text, `pseudo` adds conservative structured control flow, `ir` exposes lifted operations, and `json` emits `airece.semantic.v1`. |
+| `--view <agent\|compact\|pseudo\|ir\|json>` | Selects the output. `agent` is a small behavioral digest, `compact` is bounded semantic text, `pseudo` adds conservative structured control flow, `ir` exposes lifted operations, and `json` emits `airece.semantic.v1`. |
 | `--json` | Alias for `--view json`. |
 | `--max-bytes <count>` | Maximum output bytes. |
 | `--max-statements <count>` | Maximum statements returned. |
@@ -146,6 +146,12 @@ These apply to `fn`.
 ### Symbolic and taint options
 
 Symbolic work is opt-in. Normal compact and agent views do not initialize a solver.
+
+The agent view starts with ordered behavior records. These connect branch predicates and
+switch cases to their results, preserve guarded indirect-call targets and argument bindings,
+summarize internal callees one level deep, describe persistent state updates, and represent
+recursive helpers as bounded recurrences when the evidence supports one. The older fact
+tables remain in the same JSON document for direct lookup and evidence citation.
 
 | Flag | Meaning |
 |---|---|
@@ -243,6 +249,21 @@ sessions. AIRECE passed more behavioral reconstruction tests in every tier:
 Objective field results were `61/117` versus `51/117` in the single tier, `56/117`
 versus `42/117` in the common tier, and `66/117` versus `61/117` in the native tier.
 There were no timeouts, transport retries, transcript compactions, or failed harness jobs.
+
+The matching one-repetition Grok 4.6 run compiled all reconstructions. AIRECE led the
+single-context reconstruction tier and the objective semantic score in each tier. Ghidra led
+common and native reconstruction, with the loss concentrated in the indirect-call fixture and,
+for the common tier, the global-state and sparse-switch fixtures. Those findings motivated the
+v0.11.0 behavior-view changes above; the table below remains the v0.10.0 diagnostic baseline.
+
+| Tier | AIRECE reconstruction | Ghidra reconstruction | AIRECE minus Ghidra |
+|---|---:|---:|---:|
+| Single context | 390/512 | 330/512 | +11.7 percentage points |
+| Common agentic | 384/512 | 511/512 | -24.8 percentage points |
+| Native agentic | 453/512 | 511/512 | -11.3 percentage points |
+
+The Grok run completed 102 sessions with no timeouts, retries, transcript compactions, or
+failed jobs. Its recorded OpenRouter cost was $2.16.
 
 Run the local-model configuration:
 

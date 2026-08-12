@@ -106,6 +106,29 @@ AIRECE_EXPORT int airece_semantic_memory_flow(int* output, int input) {
     return *output;
 }
 
+static AIRECE_NOINLINE uint32_t agent_add(uint32_t value) {
+    return value + UINT32_C(0x21);
+}
+
+static AIRECE_NOINLINE uint32_t agent_xor(uint32_t value) {
+    return value ^ UINT32_C(0x87654321);
+}
+
+typedef uint32_t (*agent_transform)(uint32_t);
+AIRECE_EXPORT uint32_t airece_semantic_agent_indirect(uint32_t selector, uint32_t value) {
+    agent_transform selected = (selector & 1U) ? agent_add : agent_xor;
+    return selected(value) + (selector & UINT32_C(0xff));
+}
+
+static AIRECE_NOINLINE uint32_t agent_recurse(uint32_t value) {
+    if (value <= 1U) return 1U;
+    return value + agent_recurse(value - 1U);
+}
+
+AIRECE_EXPORT uint32_t airece_semantic_agent_recursion(uint32_t value) {
+    return agent_recurse(value & 7U) + UINT32_C(0x1234);
+}
+
 /* A CRT-free DLL entry seeds CFG discovery and keeps all three semantic
  * contracts reachable.  It is analyzed, never loaded or executed by tests. */
 AIRECE_EXPORT int airece_semantic_entry(void) {
@@ -117,5 +140,7 @@ AIRECE_EXPORT int airece_semantic_entry(void) {
         airece_semantic_loop((const int*)&value, 1) +
         airece_semantic_storage((int)value) +
         airece_semantic_interproc((int)value) +
-        airece_semantic_memory_flow((int*)&value, (int)value);
+        airece_semantic_memory_flow((int*)&value, (int)value) +
+        (int)airece_semantic_agent_indirect((uint32_t)value, (uint32_t)value) +
+        (int)airece_semantic_agent_recursion((uint32_t)value);
 }
