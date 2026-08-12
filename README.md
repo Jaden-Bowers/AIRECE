@@ -238,33 +238,42 @@ compiled and run against hidden tests generated from known-benign fixtures. Anal
 model requests, token use, tool calls, failures, and paired bootstrap intervals are retained
 in the run artifacts.
 
-The current Bonsai 27B run used nine balanced held-out cases, one repetition, and 102 model
-sessions. AIRECE passed more behavioral reconstruction tests in every tier:
+### Current results
 
-| Tier | AIRECE | Ghidra | AIRECE minus Ghidra |
-|---|---:|---:|---:|
-| Single context | 330/512 | 267/512 | +12.3 percentage points |
-| Common agentic | 323/512 | 128/512 | +38.1 percentage points |
-| Native agentic | 210/512 | 17/512 | +37.7 percentage points |
+The current results use the `v0.11.0-benchmark-rc2` analyzer freeze. Each model ran the same
+nine balanced held-out cases once, producing 102 paired sessions across the three tiers. These
+are useful directional results, but the sample is still small.
 
-Objective field results were `61/117` versus `51/117` in the single tier, `56/117`
-versus `42/117` in the common tier, and `66/117` versus `61/117` in the native tier.
-There were no timeouts, transport retries, transcript compactions, or failed harness jobs.
+Bonsai 27B was run locally as the 4.41 GiB Q1_0 build with a 16,384-token context and one
+generation slot. Objective values below are semantic accuracy. Reconstruction values are the
+fraction of 512 hidden behavioral tests passed; compile rate is shown separately.
 
-The matching one-repetition Grok 4.6 run compiled all reconstructions. AIRECE led the
-single-context reconstruction tier and the objective semantic score in each tier. Ghidra led
-common and native reconstruction, with the loss concentrated in the indirect-call fixture and,
-for the common tier, the global-state and sparse-switch fixtures. Those findings motivated the
-v0.11.0 behavior-view changes above; the table below remains the v0.10.0 diagnostic baseline.
+| Bonsai tier | Objective AIRECE | Objective Ghidra | Reconstruction AIRECE | Reconstruction Ghidra | Compile AIRECE / Ghidra |
+|---|---:|---:|---:|---:|---:|
+| Single context | **59.8%** | 36.5% | 295/512 (57.6%) | **331/512 (64.6%)** | 100% / 100% |
+| Common agentic | 46.5% | **50.7%** | **265/512 (51.8%)** | 248/512 (48.4%) | 87.5% / 75.0% |
+| Native agentic | **72.0%** | 52.9% | 240/512 (46.9%) | **345/512 (67.4%)** | 62.5% / 75.0% |
 
-| Tier | AIRECE reconstruction | Ghidra reconstruction | AIRECE minus Ghidra |
-|---|---:|---:|---:|
-| Single context | 390/512 | 330/512 | +11.7 percentage points |
-| Common agentic | 384/512 | 511/512 | -24.8 percentage points |
-| Native agentic | 453/512 | 511/512 | -11.3 percentage points |
+All 102 Bonsai jobs completed with no transport retries or transcript compactions. Its simple
+three-case protocol check passed cleanly, but the full tasks still exposed weak final-answer
+discipline. The harness had to normalize most common and native answers, and some remained
+structurally invalid. AIRECE's native objective interface was the clearest result for this
+model: it reached 72.0% semantic accuracy versus 52.9% for Ghidra. Ghidra remained stronger
+on native behavioral reconstruction.
 
-The Grok run completed 102 sessions with no timeouts, retries, transcript compactions, or
-failed jobs. Its recorded OpenRouter cost was $2.16.
+Grok 4.6 was run through OpenRouter with low reasoning effort. It produced valid final
+structures and clean protocol behavior throughout the agentic tiers.
+
+| Grok tier | Objective AIRECE | Objective Ghidra | Reconstruction AIRECE | Reconstruction Ghidra | Compile AIRECE / Ghidra |
+|---|---:|---:|---:|---:|---:|
+| Single context | **86.4%** | 83.2% | **512/512 (100%)** | 330/512 (64.5%) | 100% / 100% |
+| Common agentic | **82.0%** | 75.9% | **512/512 (100%)** | 511/512 (99.8%) | 100% / 100% |
+| Native agentic | **84.1%** | 75.9% | **512/512 (100%)** | 511/512 (99.8%) | 100% / 100% |
+
+The Grok run also completed all 102 jobs without failures, retries, or transcript compactions.
+In the native tier, AIRECE used 18 tool calls and 170,562 tokens across both tasks, compared
+with Ghidra's 41 calls and 240,208 tokens. The recorded OpenRouter generation cost was about
+$1.95.
 
 Run the local-model configuration:
 
