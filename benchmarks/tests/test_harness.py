@@ -149,6 +149,27 @@ class ParserScoringTests(unittest.TestCase):
             "reconstruction", "```c\n" + function + "\n```"), function)
         wrapped = json.dumps({"analysis": {"code": function}})
         self.assertEqual(_normalize_direct_final("reconstruction", wrapped), function)
+        structured = json.dumps({
+            "function_name": "target", "return_type": "uint32_t",
+            "parameters": [{"name": "a", "type": "uint32_t"},
+                           {"name": "b", "type": "uint32_t"}],
+            "body": "return a + b;"})
+        structured_function = _normalize_direct_final("reconstruction", structured)
+        self.assertEqual(_validate_direct_final("reconstruction", structured_function), [])
+        self.assertIn("return a + b;", structured_function)
+
+    def test_objective_normalizer_repairs_only_structure(self) -> None:
+        malformed = {"answers": [
+            {"question_id": "q1", "status": "answered", "constants": ["0x7"],
+             "case_values": None, "extra": "discard"},
+            {"question_id": "q2", "status": "answered", "constants": None,
+             "case_values": []}]}
+        normalized = _normalize_direct_final("objective", json.dumps(malformed))
+        value = json.loads(normalized)
+        self.assertEqual(_validate_direct_final("objective", normalized), [])
+        self.assertEqual(value["answers"][0]["constants"], [7])
+        self.assertEqual(value["answers"][0]["case_values"], [])
+        self.assertNotIn("extra", value["answers"][0])
 
 
 class CorpusTests(unittest.TestCase):

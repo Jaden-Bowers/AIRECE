@@ -114,7 +114,45 @@ def _normalize_direct_final(task: str, text: str) -> str:
     if fenced:
         candidate = fenced.group(1).strip()
     if task == "objective":
-        return candidate
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            return candidate
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("answers"), list):
+            return candidate
+        required = OBJECTIVE_SCHEMA["properties"]["answers"]["items"]["required"]
+        array_fields = {"constants", "case_values", "return_dependencies", "evidence"}
+        normalized_answers: list[dict[str, Any]] = []
+        for index, source in enumerate(parsed["answers"][:2]):
+            if not isinstance(source, dict):
+                return candidate
+            answer: dict[str, Any] = {}
+            for field in required:
+                if field in source:
+                    value = source[field]
+                elif field == "question_id":
+                    value = f"q{index + 1}"
+                elif field == "status":
+                    value = "unknown"
+                else:
+                    value = [] if field in array_fields else None
+                if field in array_fields and value is None:
+                    value = []
+                if field in {"constants", "case_values"} and isinstance(value, list):
+                    converted: list[Any] = []
+                    for item in value:
+                        if isinstance(item, str):
+                            try:
+                                item = int(item, 0)
+                            except ValueError:
+                                pass
+                        converted.append(item)
+                    value = converted
+                answer[field] = value
+            normalized_answers.append(answer)
+        if len(normalized_answers) != 2:
+            return candidate
+        return canonical_json({"answers": normalized_answers})
     if candidate.startswith("uint32_t target"):
         function, error = extract_c_function(candidate)
         if error is None and function is not None:
@@ -123,6 +161,21 @@ def _normalize_direct_final(task: str, text: str) -> str:
         parsed = json.loads(candidate)
     except json.JSONDecodeError:
         return candidate
+    if isinstance(parsed, dict):
+        parameters = parsed.get("parameters")
+        contract = (
+            parsed.get("function_name") == "target" and
+            parsed.get("return_type") == "uint32_t" and
+            isinstance(parameters, list) and
+            [(item.get("name"), item.get("type")) for item in parameters
+             if isinstance(item, dict)] == [("a", "uint32_t"), ("b", "uint32_t")] and
+            isinstance(parsed.get("body"), str))
+        if contract:
+            found, found_error = extract_c_function(
+                "uint32_t target(uint32_t a, uint32_t b) {\n" +
+                parsed["body"].strip() + "\n}")
+            if found_error is None and found is not None:
+                return found.strip()
     recovered: list[str] = []
     def visit(value: Any) -> None:
         if isinstance(value, str):
