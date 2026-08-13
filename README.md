@@ -1,16 +1,22 @@
 # AIRECE
 
-AIRECE is a command-line reverse-engineering context engine for PE/x86-64 binaries. It
+AIRECE is a command-line reverse-engineering context engine for PE and ELF x86 binaries. It
 turns XAIR analysis into bounded function summaries, pseudocode, call information,
 references, slices, paths, taint results, and directed flow answers that are practical for
 both people and coding agents.
 
 AIRECE does static analysis only. The input binary is never executed.
 
+The CLI builds and runs natively on Windows and Linux. Both builds can analyze all four
+supported input combinations: PE32, PE32+, ELF32, and ELF64. The agent view selects cdecl
+for 32-bit x86, Microsoft x64 for 64-bit PE, and System V AMD64 for 64-bit ELF.
+
 ## Build
 
-The Windows build uses Visual Studio 2022, CMake, and C++20. The three XAIR repositories
-should be checked out beside AIRECE:
+AIRECE uses CMake and C++20. The Windows preset requires Visual Studio 2022. The Linux
+preset requires GCC, Ninja, and the 32-bit GCC development libraries if you want to run the
+full architecture matrix test. The three XAIR repositories should be checked out beside
+AIRECE:
 
 ```text
 Projects/
@@ -38,6 +44,23 @@ The executable is written to:
 out/build/windows-msvc/Release/airece.exe
 ```
 
+Build and test on Linux, including WSL:
+
+```bash
+cmake --preset linux-ninja
+cmake --build --preset linux-ninja-release
+ctest --preset linux-ninja-release
+```
+
+The Linux executable is written to:
+
+```text
+out/build/linux-ninja/airece
+```
+
+The platform test compiles and analyzes native 32-bit and 64-bit fixtures. On Debian or
+Ubuntu, install `gcc-multilib` and `libc6-dev-i386` before running it.
+
 Useful CMake options:
 
 | Option | Meaning |
@@ -57,6 +80,18 @@ Example override:
 ```powershell
 cmake --preset windows-msvc -DAIRECE_ALLOW_DIRTY_DEPENDENCIES=ON
 ```
+
+### Verified platform matrix
+
+| AIRECE host | PE32 | PE32+ | ELF32 | ELF64 |
+|---|---:|---:|---:|---:|
+| Windows x64 | Yes | Yes | Yes | Yes |
+| Linux x64 / WSL2 | Yes | Yes | Yes | Yes |
+
+This matrix covers loading, targeted CFG construction, ABI-aware argument recovery, and a
+bounded agent-view return expression. Compiler-backed semantic suites also run on Windows
+and Linux. Instruction semantics are conservative: instructions without an exact XAIR
+model remain explicit or opaque instead of being guessed.
 
 ## Command line
 

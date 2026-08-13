@@ -143,19 +143,71 @@ struct State {
     std::map<std::uint64_t, std::string> global_values;
 };
 
-State initial_state() {
+struct AbiLayout {
+    const char* name;
+    std::vector<xair_x86_reg> register_arguments;
+    std::size_t pointer_bytes;
+    std::size_t first_stack_argument;
+    std::int64_t entry_stack_argument_offset;
+};
+
+AbiLayout abi_layout(const xair_binary_view& binary) {
+    if (binary.arch == XAIR_ARCH_X86_32) {
+        return {"cdecl-x86", {}, 4, 0, 4};
+    }
+    if (binary.format == XAIR_BINARY_FORMAT_PE) {
+        return {"win64", {XAIR_X86_RCX, XAIR_X86_RDX, XAIR_X86_R8, XAIR_X86_R9},
+            8, 4, 0x28};
+    }
+    return {"sysv-x64",
+        {XAIR_X86_RDI, XAIR_X86_RSI, XAIR_X86_RDX, XAIR_X86_RCX,
+            XAIR_X86_R8, XAIR_X86_R9},
+        8, 6, 8};
+}
+
+std::string stack_slot_key(const std::int64_t offset) {
+    return "stack:" + std::to_string(offset);
+}
+
+State initial_state(
+    const xair_binary_view& binary,
+    const std::size_t argument_capacity) {
     State state;
     for (std::size_t index = 0; index < state.registers.size(); ++index) {
         state.registers[index] = "reg" + std::to_string(index);
         state.stack_offsets[index] = std::numeric_limits<std::int64_t>::min();
     }
-    state.registers[XAIR_X86_RCX] = "arg0";
-    state.registers[XAIR_X86_RDX] = "arg1";
-    state.registers[XAIR_X86_R8] = "arg2";
-    state.registers[XAIR_X86_R9] = "arg3";
+    const AbiLayout abi = abi_layout(binary);
+    const std::size_t register_count = std::min(
+        argument_capacity, abi.register_arguments.size());
+    for (std::size_t index = 0; index < register_count; ++index) {
+        state.registers[abi.register_arguments[index]] = "arg" + std::to_string(index);
+    }
+    for (std::size_t index = abi.first_stack_argument;
+         index < argument_capacity; ++index) {
+        const std::int64_t offset = abi.entry_stack_argument_offset +
+            static_cast<std::int64_t>(index - abi.first_stack_argument) *
+                static_cast<std::int64_t>(abi.pointer_bytes);
+        state.stack_values[stack_slot_key(offset)] = "arg" + std::to_string(index);
+    }
     state.registers[XAIR_X86_RAX] = "unknown_return";
     state.stack_offsets[XAIR_X86_RSP] = 0;
     return state;
+}
+
+std::optional<std::size_t> argument_index(const std::string_view value) {
+    if (!value.starts_with("arg") || value.size() == 3) return std::nullopt;
+    std::size_t result = 0;
+    for (std::size_t index = 3; index < value.size(); ++index) {
+        const char character = value[index];
+        if (character < '0' || character > '9') return std::nullopt;
+        const std::size_t digit = static_cast<std::size_t>(character - '0');
+        if (result > (std::numeric_limits<std::size_t>::max() - digit) / 10) {
+            return std::nullopt;
+        }
+        result = result * 10 + digit;
+    }
+    return result;
 }
 
 std::uint64_t mask_for_bits(const std::uint16_t bits) {
@@ -224,7 +276,28 @@ std::string stack_key(const State& state, const xair_x86_memory_operand& memory)
         if (!index) return {};
         offset += *index * memory.scale;
     }
-    return "stack:" + std::to_string(offset);
+    return stack_slot_key(offset);
+}
+
+std::string abi_argument_value(
+    const xair_binary_view& binary,
+    const State& state,
+    const std::size_t index,
+    const bool at_call_site) {
+    const AbiLayout abi = abi_layout(binary);
+    if (index < abi.register_arguments.size()) {
+        return state.registers[abi.register_arguments[index]];
+    }
+    if (index < abi.first_stack_argument) return "unknown";
+    const std::int64_t stack_pointer = state.stack_offsets[XAIR_X86_RSP];
+    if (stack_pointer == std::numeric_limits<std::int64_t>::min()) return "unknown";
+    const std::int64_t base = abi.entry_stack_argument_offset -
+        (at_call_site ? static_cast<std::int64_t>(abi.pointer_bytes) : 0);
+    const std::int64_t offset = stack_pointer + base +
+        static_cast<std::int64_t>(index - abi.first_stack_argument) *
+            static_cast<std::int64_t>(abi.pointer_bytes);
+    const auto found = state.stack_values.find(stack_slot_key(offset));
+    return found == state.stack_values.end() ? "unknown" : found->second;
 }
 
 std::string operand_value(
@@ -366,6 +439,35 @@ struct Digest {
     std::size_t omitted{};
 };
 
+void observe_arguments(
+    Digest& digest,
+    const std::string_view expression,
+    const std::uint16_t bits) {
+    std::size_t position = 0;
+    while ((position = expression.find("arg", position)) != std::string_view::npos) {
+        const bool valid_prefix = position == 0 ||
+            (expression[position - 1] != '_' &&
+             (expression[position - 1] < '0' || expression[position - 1] > '9') &&
+             (expression[position - 1] < 'A' || expression[position - 1] > 'Z') &&
+             (expression[position - 1] < 'a' || expression[position - 1] > 'z'));
+        std::size_t end = position + 3;
+        while (end < expression.size() && expression[end] >= '0' &&
+               expression[end] <= '9') ++end;
+        const bool valid_suffix = end == expression.size() ||
+            (expression[end] != '_' &&
+             (expression[end] < '0' || expression[end] > '9') &&
+             (expression[end] < 'A' || expression[end] > 'Z') &&
+             (expression[end] < 'a' || expression[end] > 'z'));
+        if (valid_prefix && valid_suffix) {
+            const auto index = argument_index(expression.substr(position, end - position));
+            if (index && *index < digest.parameter_bits.size()) {
+                digest.parameter_bits[*index] = std::max(digest.parameter_bits[*index], bits);
+            }
+        }
+        position = std::max(end, position + 3);
+    }
+}
+
 void append_unique(std::vector<Fact>& facts, Fact fact) {
     if (std::none_of(facts.begin(), facts.end(), [&](const Fact& existing) {
             return existing.text == fact.text && existing.evidence == fact.evidence;
@@ -480,18 +582,9 @@ NodeResult interpret_node(
                 instruction.operands[1].value.reg.parent;
         for (std::size_t index = 0; index < instruction.visible_operand_count; ++index) {
             const xair_x86_operand& operand = instruction.operands[index];
-            if (!zeroing_xor && operand.kind == XAIR_X86_OPERAND_REGISTER &&
-                (operand.actions & XAIR_X86_ACTION_READ) != 0) {
-                std::size_t argument = static_cast<std::size_t>(-1);
-                const std::string value = register_value(result.state, operand.value.reg);
-                if (value == "arg0") argument = 0;
-                else if (value == "arg1") argument = 1;
-                else if (value == "arg2") argument = 2;
-                else if (value == "arg3") argument = 3;
-                if (argument < digest.parameter_bits.size()) {
-                    digest.parameter_bits[argument] = std::max(
-                        digest.parameter_bits[argument], operand.size_bits);
-                }
+            if (!zeroing_xor && (operand.actions & XAIR_X86_ACTION_READ) != 0) {
+                observe_arguments(digest,
+                    operand_value(binary, result.state, operand, end), operand.size_bits);
             }
             if (operand.kind == XAIR_X86_OPERAND_IMMEDIATE &&
                 operand.immediate_is_relative == 0) {
@@ -532,6 +625,45 @@ NodeResult interpret_node(
                 : std::string("unknown");
         };
         switch (instruction.mnemonic) {
+        case XAIR_X86_MNEMONIC_PUSH:
+            if (instruction.visible_operand_count >= 1) {
+                const AbiLayout abi = abi_layout(binary);
+                const std::string value = operand(0);
+                if (result.state.stack_offsets[XAIR_X86_RSP] !=
+                    std::numeric_limits<std::int64_t>::min()) {
+                    result.state.stack_offsets[XAIR_X86_RSP] -=
+                        static_cast<std::int64_t>(abi.pointer_bytes);
+                    result.state.stack_values[stack_slot_key(
+                        result.state.stack_offsets[XAIR_X86_RSP])] = value;
+                }
+            }
+            break;
+        case XAIR_X86_MNEMONIC_POP:
+            if (instruction.visible_operand_count >= 1 &&
+                result.state.stack_offsets[XAIR_X86_RSP] !=
+                    std::numeric_limits<std::int64_t>::min()) {
+                const AbiLayout abi = abi_layout(binary);
+                const std::int64_t offset = result.state.stack_offsets[XAIR_X86_RSP];
+                const auto found = result.state.stack_values.find(stack_slot_key(offset));
+                const std::string value = found == result.state.stack_values.end()
+                    ? "unknown_stack_value" : found->second;
+                write_register(result.state, instruction.operands[0], value);
+                write_memory(result.state, instruction.operands[0], value, end);
+                result.state.stack_offsets[XAIR_X86_RSP] +=
+                    static_cast<std::int64_t>(abi.pointer_bytes);
+            }
+            break;
+        case XAIR_X86_MNEMONIC_LEAVE:
+            if (result.state.stack_offsets[XAIR_X86_RBP] !=
+                std::numeric_limits<std::int64_t>::min()) {
+                const AbiLayout abi = abi_layout(binary);
+                result.state.stack_offsets[XAIR_X86_RSP] =
+                    result.state.stack_offsets[XAIR_X86_RBP] +
+                    static_cast<std::int64_t>(abi.pointer_bytes);
+                result.state.stack_offsets[XAIR_X86_RBP] =
+                    std::numeric_limits<std::int64_t>::min();
+            }
+            break;
         case XAIR_X86_MNEMONIC_MOV:
         case XAIR_X86_MNEMONIC_MOVZX:
         case XAIR_X86_MNEMONIC_MOVSX:
@@ -567,6 +699,18 @@ NodeResult interpret_node(
             if (instruction.visible_operand_count >= 2 &&
                 instruction.operands[1].kind == XAIR_X86_OPERAND_MEMORY) {
                 const xair_x86_memory_operand& memory = instruction.operands[1].value.mem;
+                if (instruction.operands[0].kind == XAIR_X86_OPERAND_REGISTER &&
+                    memory.has_base != 0 && memory.has_index == 0) {
+                    const auto destination = static_cast<std::size_t>(
+                        instruction.operands[0].value.reg.parent);
+                    const auto source = static_cast<std::size_t>(memory.base.parent);
+                    if (source < result.state.stack_offsets.size() &&
+                        result.state.stack_offsets[source] !=
+                            std::numeric_limits<std::int64_t>::min()) {
+                        result.state.stack_offsets[destination] =
+                            result.state.stack_offsets[source] + memory.displacement;
+                    }
+                }
                 if (memory.displacement != 0 && memory.kind != XAIR_X86_MEM_RIP_REL) {
                     const std::uint64_t magnitude = memory.displacement < 0
                         ? static_cast<std::uint64_t>(-(memory.displacement + 1)) + 1
@@ -637,6 +781,7 @@ NodeResult interpret_node(
                     ? operation + '(' + left + ", " + right + ')'
                     : binary_expression(left, operation, right);
                 write_register(result.state, instruction.operands[0], expression);
+                write_memory(result.state, instruction.operands[0], expression, end);
                 if (instruction.mnemonic == XAIR_X86_MNEMONIC_SUB) {
                     compare_left = left;
                     compare_right = right;
@@ -661,9 +806,10 @@ NodeResult interpret_node(
         case XAIR_X86_MNEMONIC_INC:
         case XAIR_X86_MNEMONIC_DEC:
             if (instruction.visible_operand_count >= 1) {
-                write_register(result.state, instruction.operands[0],
-                    binary_expression(operand(0),
-                        instruction.mnemonic == XAIR_X86_MNEMONIC_INC ? "+" : "-", "1"));
+                const std::string expression = binary_expression(operand(0),
+                    instruction.mnemonic == XAIR_X86_MNEMONIC_INC ? "+" : "-", "1");
+                write_register(result.state, instruction.operands[0], expression);
+                write_memory(result.state, instruction.operands[0], expression, end);
             }
             break;
         case XAIR_X86_MNEMONIC_CMP:
@@ -721,7 +867,8 @@ NodeResult interpret_node(
                 target = "indirect";
                 if (instruction.visible_operand_count > 0) target_expression = operand(0);
             }
-            const std::string argument = result.state.registers[XAIR_X86_RCX];
+            const std::string argument = abi_argument_value(
+                binary, result.state, 0, true);
             const std::string call = target + "(arg0=" + argument + ')';
             append_unique(digest.calls, {call, evidence});
             result.state.registers[XAIR_X86_RAX] =
@@ -866,9 +1013,10 @@ CalleeSummary summarize_callee(
         if (xair_binary_view_find_segment(
                 &session.binary(), target, XAIR_BINARY_PERM_EXEC) == nullptr) return summary;
         Digest scoped;
-        scoped.parameter_bits.resize(4);
+        scoped.parameter_bits.resize(16);
         NodeResult linear = interpret_linear_fallthrough(
-            session.binary(), target, initial_state(), scoped);
+            session.binary(), target,
+            initial_state(session.binary(), scoped.parameter_bits.size()), scoped);
         if (!linear.return_expression.empty()) {
             const std::string evidence = evidence_id(target,
                 linear.return_end > target ? linear.return_end : target);
@@ -909,9 +1057,10 @@ CalleeSummary summarize_callee(
     }
 
     Digest scoped;
-    scoped.parameter_bits.resize(4);
+    scoped.parameter_bits.resize(16);
     std::deque<PathState> queue;
-    queue.push_back({entry, initial_state(), {}, {}});
+    queue.push_back({entry,
+        initial_state(session.binary(), scoped.parameter_bits.size()), {}, {}});
     std::size_t explored = 0;
     while (!queue.empty() && explored++ < 128 && summary.paths.size() < 16) {
         PathState path = std::move(queue.front());
@@ -989,6 +1138,7 @@ void attach_callee_summaries(const AnalysisSession& session, Digest& digest) {
 }
 
 std::string render_digest(
+    const xair_binary_view& binary,
     const FunctionInfo& function,
     const CompactFunctionView& semantic,
     const Digest& digest) {
@@ -1024,7 +1174,14 @@ std::string render_digest(
            !mentions_argument(parameter_count - 1)) {
         --parameter_count;
     }
-    out << "{\"schema\":\"" << agent_json_schema << "\",\"function\":{\"entry\":\"" <<
+    const AbiLayout abi = abi_layout(binary);
+    out << "{\"schema\":\"" << agent_json_schema << "\",\"binary\":{\"format\":";
+    quoted(out, xair_binary_format_name(binary.format));
+    out << ",\"architecture\":";
+    quoted(out, xair_arch_name(binary.arch));
+    out << ",\"calling_convention\":";
+    quoted(out, abi.name);
+    out << "},\"function\":{\"entry\":\"" <<
         hex_value(function.entry) << "\",\"name\":";
     quoted(out, function.name);
     out << ",\"parameter_count\":" << parameter_count <<
@@ -1233,11 +1390,13 @@ std::string render_agent_json(
     const CompactFunctionView& semantic,
     const std::size_t max_bytes) {
     Digest digest;
-    digest.parameter_bits.resize(std::max<std::size_t>(semantic.parameters.size(), 4));
+    digest.parameter_bits.resize(std::max<std::size_t>(semantic.parameters.size(), 16));
+    const State entry_state = initial_state(
+        session.binary(), digest.parameter_bits.size());
     std::unordered_map<xair_cfg_node_id, State> inputs;
     std::unordered_map<xair_cfg_node_id, NodeResult> outputs;
     std::deque<xair_cfg_node_id> worklist;
-    inputs.emplace(semantic.control.entry, initial_state());
+    inputs.emplace(semantic.control.entry, entry_state);
     worklist.push_back(semantic.control.entry);
 
     std::unordered_map<xair_cfg_node_id, std::vector<xair_cfg_node_id>> successors;
@@ -1323,7 +1482,7 @@ std::string render_agent_json(
     // intentionally visits a CFG node once; that is useful for a stable digest but
     // would otherwise collapse O0 diamonds onto whichever predecessor arrived first.
     std::deque<PathState> paths;
-    paths.push_back({semantic.control.entry, initial_state(), {}, {}});
+    paths.push_back({semantic.control.entry, entry_state, {}, {}});
     std::size_t explored_paths = 0;
     while (!paths.empty() && explored_paths < 1024) {
         PathState path = std::move(paths.front());
@@ -1384,7 +1543,8 @@ std::string render_agent_json(
         if (header_output != outputs.end() && !header_output->second.index_expression.empty()) {
             fact.selector = header_output->second.index_expression;
         } else if (header_input != inputs.end()) {
-            fact.selector = header_input->second.registers[XAIR_X86_RCX];
+            fact.selector = abi_argument_value(
+                session.binary(), header_input->second, 0, false);
         } else {
             fact.selector = "unknown";
         }
@@ -1423,7 +1583,7 @@ std::string render_agent_json(
     }
     attach_callee_summaries(session, digest);
 
-    std::string rendered = render_digest(function, semantic, digest);
+    std::string rendered = render_digest(session.binary(), function, semantic, digest);
     while (max_bytes != 0 && rendered.size() > max_bytes) {
         bool removed = false;
         const auto trim = [&](auto& items) {
@@ -1466,7 +1626,7 @@ std::string render_agent_json(
         }
         if (!removed) return "{\"schema\":\"airece.agent-function.v1\",\"complete\":false,"
             "\"truncated\":true,\"omitted\":{\"facts\":1}}\n";
-        rendered = render_digest(function, semantic, digest);
+        rendered = render_digest(session.binary(), function, semantic, digest);
     }
     return rendered;
 }

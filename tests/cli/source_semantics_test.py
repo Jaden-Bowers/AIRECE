@@ -9,7 +9,6 @@ import pathlib
 import re
 import struct
 import subprocess
-import sys
 import tempfile
 
 
@@ -74,6 +73,80 @@ def pe_exports(path: pathlib.Path) -> dict[str, str]:
     return result
 
 
+def elf_exports(path: pathlib.Path) -> dict[str, str]:
+    """Read function symbols from ELF32 or ELF64 without external tools."""
+    data = path.read_bytes()
+    if data[:4] != b"\x7fELF":
+        raise AssertionError("source fixture is not ELF")
+    elf_class = data[4]
+    endian = "<" if data[5] == 1 else ">" if data[5] == 2 else None
+    if endian is None:
+        raise AssertionError("unsupported ELF byte order")
+    if elf_class == 2:
+        section_offset = struct.unpack_from(endian + "Q", data, 40)[0]
+        section_size, section_count = struct.unpack_from(endian + "HH", data, 58)
+
+        def section(index: int) -> tuple[int, int, int, int]:
+            offset = section_offset + index * section_size
+            section_type = struct.unpack_from(endian + "I", data, offset + 4)[0]
+            file_offset, size = struct.unpack_from(endian + "QQ", data, offset + 24)
+            link = struct.unpack_from(endian + "I", data, offset + 40)[0]
+            entry_size = struct.unpack_from(endian + "Q", data, offset + 56)[0]
+            return section_type, file_offset, size, link, entry_size
+
+        def symbol(offset: int) -> tuple[int, int, int, int]:
+            name = struct.unpack_from(endian + "I", data, offset)[0]
+            info = data[offset + 4]
+            section_index = struct.unpack_from(endian + "H", data, offset + 6)[0]
+            value = struct.unpack_from(endian + "Q", data, offset + 8)[0]
+            return name, info, section_index, value
+    elif elf_class == 1:
+        section_offset = struct.unpack_from(endian + "I", data, 32)[0]
+        section_size, section_count = struct.unpack_from(endian + "HH", data, 46)
+
+        def section(index: int) -> tuple[int, int, int, int]:
+            offset = section_offset + index * section_size
+            section_type = struct.unpack_from(endian + "I", data, offset + 4)[0]
+            file_offset, size, link = struct.unpack_from(endian + "III", data, offset + 16)
+            entry_size = struct.unpack_from(endian + "I", data, offset + 36)[0]
+            return section_type, file_offset, size, link, entry_size
+
+        def symbol(offset: int) -> tuple[int, int, int, int]:
+            name, value = struct.unpack_from(endian + "II", data, offset)
+            info = data[offset + 12]
+            section_index = struct.unpack_from(endian + "H", data, offset + 14)[0]
+            return name, info, section_index, value
+    else:
+        raise AssertionError(f"unsupported ELF class: {elf_class}")
+
+    sections = [section(index) for index in range(section_count)]
+    result: dict[str, str] = {}
+    for section_type, file_offset, size, link, entry_size in sections:
+        if section_type not in (2, 11) or entry_size == 0 or link >= len(sections):
+            continue
+        _, strings_offset, strings_size, _, _ = sections[link]
+        strings = data[strings_offset:strings_offset + strings_size]
+        for entry_offset in range(file_offset, file_offset + size, entry_size):
+            name_offset, info, section_index, value = symbol(entry_offset)
+            if (info & 0x0F) != 2 or section_index == 0 or value == 0 or name_offset >= len(strings):
+                continue
+            end = strings.find(b"\0", name_offset)
+            if end < 0:
+                continue
+            name = strings[name_offset:end].decode("utf-8", errors="replace")
+            result[name] = f"0x{value:x}"
+    return result
+
+
+def binary_exports(path: pathlib.Path) -> dict[str, str]:
+    data = path.read_bytes()[:4]
+    if data[:2] == b"MZ":
+        return pe_exports(path)
+    if data == b"\x7fELF":
+        return elf_exports(path)
+    raise AssertionError("source fixture is neither PE nor ELF")
+
+
 def clang_fixtures(source: pathlib.Path, clang_cl: pathlib.Path,
                    lld_link: pathlib.Path, directory: pathlib.Path) -> list[pathlib.Path]:
     fixtures: list[pathlib.Path] = []
@@ -99,7 +172,7 @@ def clang_fixtures(source: pathlib.Path, clang_cl: pathlib.Path,
 
 
 def verify_fixture(airece: pathlib.Path, fixture: pathlib.Path) -> None:
-    exports = pe_exports(fixture)
+    exports = binary_exports(fixture)
     expected = {
         "airece_semantic_load", "airece_semantic_branch",
         "airece_semantic_switch", "airece_semantic_dense_switch",

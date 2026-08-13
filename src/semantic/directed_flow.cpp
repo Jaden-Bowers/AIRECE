@@ -814,7 +814,10 @@ bool propagate_operation(
                         options.max_states) || changed;
                 }
             }
-            return changed;
+            // PLT/IAT-style thunks can be discovered as functions even though
+            // they have no modeled return value. In that case retain the
+            // conservative unknown-call input-to-result summary below.
+            if (!returns.empty()) return changed;
         }
         // Unknown and imported calls are conservative summaries: a scalar input
         // may influence a scalar return, but memory-state values are never folded

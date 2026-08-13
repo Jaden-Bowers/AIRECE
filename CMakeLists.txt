@@ -9,7 +9,7 @@ project(AIRECE VERSION 0.11.0 LANGUAGES C CXX)
 # This identifier is intentionally independent of the semantic/flow schema
 # versions.  Benchmark reports require it so results cannot silently mix
 # binaries built before and after the release-candidate freeze.
-set(AIRECE_BENCHMARK_FREEZE "v0.11.0-benchmark-rc2")
+set(AIRECE_BENCHMARK_FREEZE "v0.11.0-platform-rc1")
 
 # CMake projects configured before CMP0184 may retain /RTC1 in cached Debug
 # flags.  Move that setting to the target property so the CRT-free compiler
@@ -87,7 +87,8 @@ endforeach()
 
 function(airece_git_revision source expected output)
     execute_process(
-        COMMAND git -C "${source}" rev-parse HEAD
+        COMMAND git -c core.filemode=false -c core.autocrlf=true
+            -C "${source}" rev-parse HEAD
         RESULT_VARIABLE _git_result
         OUTPUT_VARIABLE _revision
         OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -100,7 +101,12 @@ function(airece_git_revision source expected output)
             "Dependency pin mismatch for ${source}: expected ${expected}, found ${_revision}")
     endif()
     execute_process(
-        COMMAND git -C "${source}" status --porcelain
+        # A checkout shared by Windows and WSL can appear dirty solely because
+        # NTFS does not preserve Unix modes and a checkout shared with Windows
+        # may contain CRLF worktree files. Content changes still fail the
+        # release build; only platform representation noise is ignored here.
+        COMMAND git -c core.filemode=false -c core.autocrlf=true
+            -C "${source}" status --porcelain
         RESULT_VARIABLE _status_result
         OUTPUT_VARIABLE _dirty
         OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -244,9 +250,9 @@ if(BUILD_TESTING)
             target_link_options(${target} PRIVATE
                 /ENTRY:airece_semantic_entry /NODEFAULTLIB)
         elseif(optimized)
-            target_compile_options(${target} PRIVATE -O2)
+            target_compile_options(${target} PRIVATE -O2 -fno-semantic-interposition)
         else()
-            target_compile_options(${target} PRIVATE -O0)
+            target_compile_options(${target} PRIVATE -O0 -fno-semantic-interposition)
         endif()
     endfunction()
     airece_add_semantic_fixture(
@@ -374,6 +380,25 @@ if(BUILD_TESTING)
             $<TARGET_FILE:airece_semantic_source_fixture>
             $<TARGET_FILE:airece_semantic_source_fixture_opt>
             ${AIRECE_CLANG_FIXTURE_ARGUMENTS})
+
+    if(WIN32 AND AIRECE_CLANG_CL_EXECUTABLE AND AIRECE_LLD_LINK_EXECUTABLE)
+        add_test(NAME airece_platform_matrix
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/platform_matrix_test.py"
+                --airece $<TARGET_FILE:airece>
+                --source "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/platform_abi.c"
+                --format pe
+                --clang-cl "${AIRECE_CLANG_CL_EXECUTABLE}"
+                --lld-link "${AIRECE_LLD_LINK_EXECUTABLE}")
+    elseif(UNIX)
+        add_test(NAME airece_platform_matrix
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/platform_matrix_test.py"
+                --airece $<TARGET_FILE:airece>
+                --source "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/platform_abi.c"
+                --format elf
+                --cc "${CMAKE_C_COMPILER}")
+    endif()
 
     add_test(NAME airece_evaluation_smoke
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/evaluate.py"

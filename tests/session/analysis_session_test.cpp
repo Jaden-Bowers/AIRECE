@@ -344,7 +344,12 @@ void test_import_lookup(const std::filesystem::path& executable) {
             checked_ordinal = true;
         }
     }
-    expect(checked_name, "real PE provides at least one named import call reference");
+    if (opened.session->binary().format == XAIR_BINARY_FORMAT_PE) {
+        expect(checked_name, "real PE provides at least one named import call reference");
+    } else {
+        expect(opened.session->binary().format == XAIR_BINARY_FORMAT_ELF,
+               "native non-PE executable is recognized as ELF");
+    }
     // Ordinal-only imports are optional in normal PE files; exercise the miss path too.
     expect(opened.session->function_by_import("missing.dll", UINT32_C(1)) == nullptr,
            "unknown import ordinals are rejected");

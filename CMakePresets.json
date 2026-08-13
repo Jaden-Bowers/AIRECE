@@ -12,6 +12,17 @@
         "AIRECE_STATIC_MSVC_RUNTIME": "ON",
         "BUILD_TESTING": "ON"
       }
+    },
+    {
+      "name": "linux-ninja",
+      "displayName": "Linux GCC with Ninja",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/linux-ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "AIRECE_ENFORCE_DEPENDENCY_PINS": "ON",
+        "BUILD_TESTING": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -24,6 +35,10 @@
       "name": "windows-msvc-debug",
       "configurePreset": "windows-msvc",
       "configuration": "Debug"
+    },
+    {
+      "name": "linux-ninja-release",
+      "configurePreset": "linux-ninja"
     }
   ],
   "testPresets": [
@@ -37,6 +52,11 @@
       "name": "windows-msvc-debug",
       "configurePreset": "windows-msvc",
       "configuration": "Debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-ninja-release",
+      "configurePreset": "linux-ninja",
       "output": { "outputOnFailure": true }
     }
   ]

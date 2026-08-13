@@ -784,7 +784,8 @@ struct ExpressionRecovery::Impl {
                 result.display = display_kind(view.opcode);
             }
         }
-        RenderState state{options, value_names};
+        RenderState state{
+            options, value_names, 0, false, 0, {}, false, {}, {}, {}};
         const Rendered rendered = render_value(value, root, 0, true, state);
         result.text = rendered.text;
         if (options.max_characters != 0 && result.text.size() > options.max_characters) {
